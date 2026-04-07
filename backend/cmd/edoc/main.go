@@ -10,23 +10,42 @@ import (
 
 	"github.com/dysorder/edoc-edualc/backend/internal/agent"
 	"github.com/dysorder/edoc-edualc/backend/internal/api"
+	"github.com/dysorder/edoc-edualc/backend/internal/config"
 	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 )
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
+	var configFile string
+
+	// 简单参数解析: --config path / serve / -p / --help
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--config" && i+1 < len(args) {
+			configFile = args[i+1]
+			args = append(args[:i], args[i+2:]...)
+			break
+		}
+	}
+
+	cfg, err := config.Load(configFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(args) > 0 {
+		switch args[0] {
 		case "serve":
-			runServer()
+			runServer(cfg)
 			return
 		case "-p":
-			if len(os.Args) < 3 {
+			if len(args) < 2 {
 				fmt.Fprintln(os.Stderr, "Usage: edoc -p \"prompt\"")
 				os.Exit(1)
 			}
-			runOnce(strings.Join(os.Args[2:], " "))
+			runOnce(cfg, strings.Join(args[1:], " "))
 			return
 		case "--help", "-h":
 			printUsage()
@@ -34,84 +53,81 @@ func main() {
 		}
 	}
 
-	runREPL()
+	runREPL(cfg)
 }
 
 func printUsage() {
 	fmt.Println("edoc-edualc - AI coding assistant")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  edoc                  Start interactive REPL")
-	fmt.Println("  edoc -p \"prompt\"      Run a single prompt")
-	fmt.Println("  edoc serve            Start the web API server")
+	fmt.Println("  edoc                        Start interactive REPL")
+	fmt.Println("  edoc -p \"prompt\"            Run a single prompt")
+	fmt.Println("  edoc serve                  Start the web API server")
+	fmt.Println("  edoc --config path          Specify config file")
 	fmt.Println()
-	fmt.Println("Environment variables:")
-	fmt.Println("  ANTHROPIC_API_KEY     Anthropic API key")
-	fmt.Println("  OPENAI_API_KEY        OpenAI API key")
-	fmt.Println("  ANTHROPIC_BASE_URL    Custom Anthropic base URL")
-	fmt.Println("  OPENAI_BASE_URL       Custom OpenAI base URL")
-	fmt.Println("  EDOC_MODEL            Model to use (default: claude-sonnet-4-20250514)")
-	fmt.Println("  EDOC_PROVIDER         Provider: anthropic or openai (default: anthropic)")
-	fmt.Println("  EDOC_PORT             Server port (default: 8080)")
+	fmt.Println("Config: config.yaml (or set --config). Env vars: EDOC_* prefix.")
+	fmt.Println("See config.example.yaml for all options.")
 }
 
-func buildConfig() agent.Config {
-	workDir, _ := os.Getwd()
-	reg := tool.DefaultRegistry(workDir)
-	p := buildProvider()
-	model := os.Getenv("EDOC_MODEL")
-	if model == "" {
-		model = "claude-sonnet-4-20250514"
+// buildProvider 根据 config 创建 Provider 实例
+func buildProvider(cfg *config.Config) provider.Provider {
+	switch cfg.Provider.Default {
+	case "openai":
+		return provider.NewOpenAIProvider(cfg.OpenAI.APIKey, cfg.Provider.Model, cfg.OpenAI.BaseURL)
+	default:
+		return provider.NewAnthropicProvider(cfg.Anthropic.APIKey, cfg.Provider.Model, cfg.Anthropic.BaseURL)
 	}
+}
+
+// parseShellType 将配置字符串转换为 tool.ShellType
+func parseShellType(s string) tool.ShellType {
+	switch s {
+	case "powershell":
+		return tool.ShellPowerShell
+	case "bash":
+		return tool.ShellBash
+	case "cmd":
+		return tool.ShellCmd
+	default:
+		return tool.ShellAuto
+	}
+}
+
+// buildAgentConfig 组装 agent.Config
+func buildAgentConfig(cfg *config.Config) agent.Config {
+	workDir := cfg.Tools.WorkDir
+	if workDir == "." {
+		workDir, _ = os.Getwd()
+	}
+
+	shell := parseShellType(cfg.Tools.Shell)
+	reg := tool.NewRegistry()
+	reg.Register(tool.NewBashTool(workDir, shell))
+	reg.Register(tool.NewReadTool())
+	reg.Register(tool.NewWriteTool())
+	reg.Register(tool.NewGlobTool())
+	reg.Register(tool.NewGrepTool())
+	reg.Register(tool.NewEditTool())
 
 	return agent.Config{
-		Provider:     p,
+		Provider:     buildProvider(cfg),
 		Registry:     reg,
 		SystemPrompt: prompt.BuildSystemPrompt(workDir),
-		Model:        model,
-		MaxTokens:    8192,
-	}
-}
-
-func buildProvider() provider.Provider {
-	providerName := os.Getenv("EDOC_PROVIDER")
-	if providerName == "" {
-		providerName = "anthropic"
-	}
-
-	switch providerName {
-	case "openai":
-		apiKey := os.Getenv("OPENAI_API_KEY")
-		if apiKey == "" {
-			fmt.Fprintln(os.Stderr, "OPENAI_API_KEY not set")
-			os.Exit(1)
-		}
-		model := os.Getenv("EDOC_MODEL")
-		if model == "" {
-			model = "gpt-4o"
-		}
-		return provider.NewOpenAIProvider(apiKey, model, os.Getenv("OPENAI_BASE_URL"))
-	default:
-		apiKey := os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			fmt.Fprintln(os.Stderr, "ANTHROPIC_API_KEY not set")
-			os.Exit(1)
-		}
-		model := os.Getenv("EDOC_MODEL")
-		if model == "" {
-			model = "claude-sonnet-4-20250514"
-		}
-		return provider.NewAnthropicProvider(apiKey, model, os.Getenv("ANTHROPIC_BASE_URL"))
+		Model:        cfg.Provider.Model,
+		MaxTokens:    cfg.Agent.MaxTokens,
+		MaxTurns:     cfg.Agent.MaxTurns,
+		AutoCompactThreshold: cfg.Agent.AutoCompactThreshold,
+		ModelBackup:          cfg.Provider.ModelBackup,
 	}
 }
 
 // runOnce executes a single prompt and exits. Maps to `claude -p "..."`.
-func runOnce(userPrompt string) {
-	cfg := buildConfig()
+func runOnce(cfg *config.Config, userPrompt string) {
+	agentCfg := buildAgentConfig(cfg)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	for evt := range agent.Run(ctx, cfg, userPrompt) {
+	for evt := range agent.Run(ctx, agentCfg, userPrompt) {
 		switch evt.Type {
 		case "text_delta":
 			fmt.Print(evt.Delta)
@@ -131,11 +147,12 @@ func runOnce(userPrompt string) {
 }
 
 // runREPL starts an interactive read-eval-print loop.
-func runREPL() {
-	cfg := buildConfig()
+func runREPL(cfg *config.Config) {
+	agentCfg := buildAgentConfig(cfg)
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println("edoc-edualc (type /quit to exit)")
+	fmt.Printf("model: %s, provider: %s\n", cfg.Provider.Model, cfg.Provider.Default)
 	fmt.Println()
 
 	for {
@@ -153,7 +170,7 @@ func runREPL() {
 
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 
-		for evt := range agent.Run(ctx, cfg, input) {
+		for evt := range agent.Run(ctx, agentCfg, input) {
 			switch evt.Type {
 			case "text_delta":
 				fmt.Print(evt.Delta)
@@ -176,18 +193,17 @@ func runREPL() {
 }
 
 // runServer starts the Gin HTTP server.
-func runServer() {
-	port := os.Getenv("EDOC_PORT")
-	if port == "" {
-		port = "8080"
+func runServer(cfg *config.Config) {
+	p := buildProvider(cfg)
+
+	workDir := cfg.Tools.WorkDir
+	if workDir == "." {
+		workDir, _ = os.Getwd()
 	}
 
-	p := buildProvider()
-	workDir, _ := os.Getwd()
-
-	r := api.NewRouter(p, workDir)
-	fmt.Printf("Starting server on :%s\n", port)
-	if err := r.Run(":" + port); err != nil {
+	r := api.NewRouter(p, cfg, workDir)
+	fmt.Printf("Starting server on :%d (model: %s)\n", cfg.Server.Port, cfg.Provider.Model)
+	if err := r.Run(fmt.Sprintf(":%d", cfg.Server.Port)); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}

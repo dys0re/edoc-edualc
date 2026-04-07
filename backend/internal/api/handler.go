@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 
 	"github.com/dysorder/edoc-edualc/backend/internal/agent"
 	"github.com/dysorder/edoc-edualc/backend/internal/compact"
+	"github.com/dysorder/edoc-edualc/backend/internal/config"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
@@ -25,11 +25,12 @@ type ChatRequest struct {
 
 type Handler struct {
 	defaultProvider provider.Provider
-	workDir         string
+	cfg            *config.Config
+	workDir        string
 }
 
-func NewHandler(p provider.Provider, workDir string) *Handler {
-	return &Handler{defaultProvider: p, workDir: workDir}
+func NewHandler(p provider.Provider, cfg *config.Config, workDir string) *Handler {
+	return &Handler{defaultProvider: p, cfg: cfg, workDir: workDir}
 }
 
 // ChatSSE handles POST /api/chat with Server-Sent Events streaming.
@@ -124,14 +125,14 @@ func (h *Handler) Health(c *gin.Context) {
 func (h *Handler) Models(c *gin.Context) {
 	models := []map[string]string{}
 
-	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+	if h.cfg.Anthropic.APIKey != "" {
 		models = append(models,
 			map[string]string{"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
 			map[string]string{"provider": "anthropic", "model": "claude-opus-4-20250514"},
 			map[string]string{"provider": "anthropic", "model": "claude-haiku-4-5-20251001"},
 		)
 	}
-	if os.Getenv("OPENAI_API_KEY") != "" {
+	if h.cfg.OpenAI.APIKey != "" {
 		models = append(models,
 			map[string]string{"provider": "openai", "model": "gpt-4o"},
 			map[string]string{"provider": "openai", "model": "o3"},

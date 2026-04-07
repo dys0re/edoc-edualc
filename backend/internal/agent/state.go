@@ -18,6 +18,11 @@ type Config struct {
 	// AutoCompactThreshold is the token count at which auto-compact triggers.
 	// 0 = disabled. Maps to autoCompact.ts:getAutoCompactThreshold.
 	AutoCompactThreshold int
+
+	// ModelBackup is the backup model when the primary model is rate-limited.
+	// Same provider, different model (e.g., sonnet → haiku).
+	// Empty = no fallback. Maps to query.ts:188 fallbackModel.
+	ModelBackup string
 }
 
 // State is the mutable state carried between loop iterations.
@@ -25,12 +30,18 @@ type Config struct {
 type State struct {
 	Messages []message.Message
 	TurnCount int
+
+	// Recovery tracking
+	MaxOutputTokensRecoveryCount int  // 截断续写恢复次数，上限 3
+	HasAttemptedFallback         bool // 是否已尝试过 fallback model
+	HasAttemptedCompactRecovery  bool // 是否已尝试过 compact 恢复 prompt_too_long
 }
 
 // Event is emitted by the agent loop to the caller (CLI or Web handler).
 type Event struct {
 	// Type: "text_delta", "thinking_delta", "tool_use", "tool_result",
-	//       "message_complete", "turn_complete", "error"
+	//       "message_complete", "turn_complete", "compacted", "error",
+	//       "max_tokens_recovery", "max_turns_reached", "warning"
 	Type string
 
 	// For text_delta / thinking_delta
@@ -43,7 +54,7 @@ type Event struct {
 	// For tool_result
 	ToolResult *tool.Result
 
-	// For message_complete — the full assistant message
+	// For message_complete / compacted
 	Message *message.Message
 
 	// For error

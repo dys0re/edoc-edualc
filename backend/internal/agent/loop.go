@@ -12,52 +12,72 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/token"
 )
 
-// Run executes the agent loop. Maps to query.ts:241 queryLoop.
-// Events are sent to the returned channel. The channel is closed when done.
+const (
+	maxOutputTokensRecoveryLimit = 3 // 截断续写最大恢复次数，对标 query.ts:164
+)
+
+// Run executes the agent loop with a new user prompt.
+// Maps to query.ts:241 queryLoop.
 func Run(ctx context.Context, cfg Config, userPrompt string) <-chan Event {
+	return runWithMessages(ctx, cfg, []message.Message{message.NewUserMessage(userPrompt)})
+}
+
+// RunWithMessages starts the loop with pre-existing message history (for session resume).
+func RunWithMessages(ctx context.Context, cfg Config, messages []message.Message) <-chan Event {
+	return runWithMessages(ctx, cfg, messages)
+}
+
+func runWithMessages(ctx context.Context, cfg Config, messages []message.Message) <-chan Event {
 	ch := make(chan Event, 64)
 	go func() {
 		defer close(ch)
-		runLoop(ctx, cfg, userPrompt, ch)
+		loop(ctx, cfg, messages, ch)
 	}()
 	return ch
 }
 
-func runLoop(ctx context.Context, cfg Config, userPrompt string, ch chan<- Event) {
+// loop is the main agent loop. 对标 query.ts:306 while(true).
+func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<- Event) {
 	state := &State{
-		Messages:  []message.Message{message.NewUserMessage(userPrompt)},
-		TurnCount: 0,
+		Messages: messages,
 	}
 
 	toolSchemas := ToolSchemas(cfg.Registry)
 
+	// 当前使用的模型（可能被 fallback 切换）
+	currentModel := cfg.Model
+
 	for {
-		// Check context cancellation
+		// ── 1. Context 取消检查 ──
 		if ctx.Err() != nil {
 			ch <- Event{Type: "error", Error: ctx.Err()}
 			return
 		}
 
-		// Check maxTurns limit
+		// ── 2. MaxTurns 检查 ──
+		// 对标 query.ts:1705
 		if cfg.MaxTurns > 0 && state.TurnCount >= cfg.MaxTurns {
-			ch <- Event{Type: "turn_complete"}
+			ch <- Event{
+				Type: "max_turns_reached",
+				Delta: fmt.Sprintf("Reached maximum turns (%d)", cfg.MaxTurns),
+			}
 			return
 		}
 
 		state.TurnCount++
 
-		// Microcompact: clear old tool_result content (zero API cost)
-		// Maps to query.ts:414 deps.microcompact call
+		// ── 3. Microcompact: 清空旧 tool_result 内容 ──
+		// 对标 query.ts:414 deps.microcompact call
 		state.Messages = compact.Microcompact(state.Messages, 10)
 
-		// Auto compact: if token count exceeds threshold, summarize
-		// Maps to query.ts:454 deps.autocompact call
+		// ── 4. Auto compact: token 超阈值时压缩 ──
+		// 对标 query.ts:454 deps.autocompact call
 		if cfg.AutoCompactThreshold > 0 {
 			tokenCount := token.EstimateMessages(state.Messages)
 			if tokenCount > cfg.AutoCompactThreshold {
 				compactCfg := compact.CompactConfig{
 					Provider:  cfg.Provider,
-					Model:     cfg.Model,
+					Model:     currentModel,
 					MaxTokens: 8192,
 				}
 				result, err := compact.Compact(ctx, compactCfg, state.Messages, "")
@@ -75,52 +95,41 @@ func runLoop(ctx context.Context, cfg Config, userPrompt string, ch chan<- Event
 						}},
 					}}
 				}
-				// If compact fails, continue with current messages —
-				// the API may still accept them or return prompt_too_long
 			}
 		}
 
-		// Call the provider
+		// ── 5. 调用 Provider ──
 		req := provider.ChatRequest{
 			Messages:     state.Messages,
 			SystemPrompt: cfg.SystemPrompt,
 			Tools:        toolSchemas,
-			Model:        cfg.Model,
+			Model:        currentModel,
 			MaxTokens:    cfg.MaxTokens,
 		}
 
 		streamCh, err := cfg.Provider.StreamChat(ctx, req)
 		if err != nil {
-			ch <- Event{Type: "error", Error: fmt.Errorf("provider error: %w", err)}
+			if handleProviderError(ctx, cfg, state, ch, err, &currentModel) {
+				continue
+			}
 			return
 		}
 
-		// Consume stream, collect the final assistant message and tool_use blocks
-		var assistantMsg *message.Message
-		var toolUseBlocks []*message.ToolUseBlock
-
-		for evt := range streamCh {
-			switch evt.Type {
-			case "text_delta":
-				ch <- Event{Type: "text_delta", Delta: evt.Delta}
-			case "thinking_delta":
-				ch <- Event{Type: "thinking_delta", Delta: evt.Delta}
-			case "tool_use":
-				ch <- Event{Type: "tool_use", ToolName: evt.ToolUse.Name, ToolInput: string(evt.ToolUse.Input)}
-				toolUseBlocks = append(toolUseBlocks, evt.ToolUse)
-			case "message_complete":
-				assistantMsg = evt.Message
-				ch <- Event{Type: "message_complete", Message: evt.Message}
-			case "error":
-				ch <- Event{Type: "error", Error: evt.Error}
+		// ── 6. 消费流式响应 ──
+		assistantMsg, toolUseBlocks, stopReason, recovered := consumeStream(streamCh, ctx, cfg, state, ch, &currentModel)
+		if recovered {
+			continue // 流式错误已恢复，重试
+		}
+		if assistantMsg == nil && !recovered {
+			// consumeStream 已经发出了 error event（或者正常完成但无消息）
+			if len(toolUseBlocks) == 0 {
+				// 无消息也无 tool_use → 已在 consumeStream 中处理
 				return
 			}
 		}
 
-		// Check for abort after streaming
+		// ── 7. 用户中断检查 ──
 		if ctx.Err() != nil {
-			// Backfill missing tool_results for any pending tool_use blocks
-			// (maps to yieldMissingToolResultBlocks in query.ts:123)
 			for _, tu := range toolUseBlocks {
 				state.Messages = append(state.Messages,
 					message.NewToolResultMessage(tu.ID, "Interrupted by user", true))
@@ -130,32 +139,153 @@ func runLoop(ctx context.Context, cfg Config, userPrompt string, ch chan<- Event
 		}
 
 		if assistantMsg == nil {
-			ch <- Event{Type: "error", Error: fmt.Errorf("no assistant message received")}
-			return
+			return // consumeStream 已发出错误
 		}
 
-		// Append assistant message to history
 		state.Messages = append(state.Messages, *assistantMsg)
 
-		// No tool calls → conversation turn complete
+		// ── 8. Max output tokens 恢复 ──
+		// 对标 query.ts:1185-1256
+		if provider.IsMaxTokensStop(stopReason) && state.MaxOutputTokensRecoveryCount < maxOutputTokensRecoveryLimit {
+			state.MaxOutputTokensRecoveryCount++
+			state.Messages = append(state.Messages, message.NewUserMessage(
+				"Output token limit hit. Resume directly — pick up mid-thought. Break remaining work into smaller pieces.",
+			))
+			ch <- Event{
+				Type: "max_tokens_recovery",
+				Delta: fmt.Sprintf("Response truncated, auto-continuing (%d/%d)",
+					state.MaxOutputTokensRecoveryCount, maxOutputTokensRecoveryLimit),
+			}
+			continue
+		}
+
+		if provider.IsMaxTokensStop(stopReason) {
+			ch <- Event{
+				Type: "warning",
+				Delta: fmt.Sprintf("Response truncated and recovery limit (%d) reached", maxOutputTokensRecoveryLimit),
+			}
+		}
+
+		// ── 9. 无 tool 调用 → 对话结束 ──
 		if len(toolUseBlocks) == 0 {
 			ch <- Event{Type: "turn_complete"}
 			return
 		}
 
-		// Execute tools
-		// Maps to toolOrchestration.ts:runTools — partition into concurrent/serial batches
+		// ── 10. 执行 tools ──
 		results := executeTools(ctx, cfg.Registry, toolUseBlocks)
 
-		// Append tool results to messages
 		for _, r := range results {
 			state.Messages = append(state.Messages, r.msg)
 			ch <- Event{Type: "tool_result", ToolResult: &r.result, ToolName: r.toolName}
 		}
 
-		// Continue the loop — next iteration sends tool_results back to the model
+		// Tool 执行成功，重置恢复计数
+		state.MaxOutputTokensRecoveryCount = 0
 	}
 }
+
+// consumeStream 消费流式响应，返回 assistant 消息、tool_use blocks、stop reason。
+// 如果遇到可恢复错误，返回 recovered=true，调用方应 continue 重试。
+func consumeStream(
+	streamCh <-chan provider.StreamEvent,
+	ctx context.Context,
+	cfg Config,
+	state *State,
+	ch chan<- Event,
+	currentModel *string,
+) (assistantMsg *message.Message, toolUseBlocks []*message.ToolUseBlock, stopReason string, recovered bool) {
+	for evt := range streamCh {
+		switch evt.Type {
+		case "text_delta":
+			ch <- Event{Type: "text_delta", Delta: evt.Delta}
+		case "thinking_delta":
+			ch <- Event{Type: "thinking_delta", Delta: evt.Delta}
+		case "tool_use":
+			ch <- Event{Type: "tool_use", ToolName: evt.ToolUse.Name, ToolInput: string(evt.ToolUse.Input)}
+			toolUseBlocks = append(toolUseBlocks, evt.ToolUse)
+		case "message_complete":
+			assistantMsg = evt.Message
+			stopReason = evt.StopReason
+			ch <- Event{Type: "message_complete", Message: evt.Message}
+		case "error":
+			if handleProviderError(ctx, cfg, state, ch, evt.Error, currentModel) {
+				return nil, nil, "", true
+			}
+			return nil, nil, "", false
+		}
+	}
+	return assistantMsg, toolUseBlocks, stopReason, false
+}
+
+// handleProviderError 处理 Provider 错误，尝试恢复。
+// 返回 true 表示已恢复（应 continue 重试），false 表示不可恢复（已发出 error event）。
+// 对标 query.ts:893-953 的 fallback + 错误恢复逻辑。
+func handleProviderError(ctx context.Context, cfg Config, state *State, ch chan<- Event, err error, currentModel *string) bool {
+	errType := provider.ClassifyError(err)
+
+	switch errType {
+	case provider.ErrorRateLimit:
+		// 模型限流 → 尝试 fallback model
+		if cfg.ModelBackup != "" && !state.HasAttemptedFallback {
+			state.HasAttemptedFallback = true
+			*currentModel = cfg.ModelBackup
+
+			// Strip thinking blocks from previous model (signature is model-bound)
+			state.Messages = message.StripThinkingBlocks(state.Messages, cfg.ModelBackup)
+
+			ch <- Event{
+				Type: "warning",
+				Delta: fmt.Sprintf("Rate limited on %s, falling back to %s", cfg.Model, cfg.ModelBackup),
+			}
+			return true
+		}
+		ch <- Event{Type: "error", Error: fmt.Errorf("rate limited and no fallback available: %w", err)}
+		return false
+
+	case provider.ErrorPromptTooLong:
+		// 上下文超限 → 尝试 compact 恢复
+		if !state.HasAttemptedCompactRecovery {
+			state.HasAttemptedCompactRecovery = true
+			compactCfg := compact.CompactConfig{
+				Provider:  cfg.Provider,
+				Model:     *currentModel,
+				MaxTokens: 8192,
+			}
+			result, compactErr := compact.Compact(ctx, compactCfg, state.Messages, "")
+			if compactErr == nil {
+				state.Messages = result.NewMessages
+				ch <- Event{Type: "compacted", Message: &message.Message{
+					Role: message.RoleSystem,
+					Content: []message.ContentBlock{{
+						Type: message.BlockText,
+						Text: &message.TextBlock{Text: fmt.Sprintf(
+							"Emergency compact (prompt too long): %d → %d tokens",
+							result.PreCompactTokens, result.PostCompactTokens,
+						)},
+					}},
+				}}
+				return true
+			}
+		}
+		ch <- Event{Type: "error", Error: provider.ErrPromptTooLong}
+		return false
+
+	case provider.ErrorAuth:
+		ch <- Event{Type: "error", Error: fmt.Errorf("authentication failed: %w", err)}
+		return false
+
+	case provider.ErrorServer:
+		ch <- Event{Type: "error", Error: fmt.Errorf("server error: %w", err)}
+		return false
+
+	default:
+		ch <- Event{Type: "error", Error: err}
+		return false
+	}
+}
+
+// --- Tool execution ---
 
 type toolExecResult struct {
 	toolName string
@@ -166,8 +296,6 @@ type toolExecResult struct {
 // executeTools runs tool calls, respecting concurrency safety.
 // Maps to toolOrchestration.ts:19 runTools.
 func executeTools(ctx context.Context, reg *tool.Registry, blocks []*message.ToolUseBlock) []toolExecResult {
-	// Partition into batches: consecutive concurrency-safe tools run in parallel,
-	// others run serially. Maps to toolOrchestration.ts:partitionToolCalls.
 	type batch struct {
 		concurrent bool
 		blocks     []*message.ToolUseBlock
@@ -215,7 +343,6 @@ func runConcurrent(ctx context.Context, reg *tool.Registry, blocks []*message.To
 func runSingle(ctx context.Context, reg *tool.Registry, block *message.ToolUseBlock) toolExecResult {
 	t, err := reg.Get(block.Name)
 	if err != nil {
-		// Tool not found — maps to toolExecution.ts:370
 		errMsg := fmt.Sprintf("Error: No such tool available: %s", block.Name)
 		return toolExecResult{
 			toolName: block.Name,
@@ -238,126 +365,5 @@ func runSingle(ctx context.Context, reg *tool.Registry, block *message.ToolUseBl
 		toolName: block.Name,
 		msg:      message.NewToolResultMessage(block.ID, result.Content, result.IsError),
 		result:   *result,
-	}
-}
-
-// RunWithMessages starts the loop with pre-existing message history (for session resume).
-func RunWithMessages(ctx context.Context, cfg Config, messages []message.Message) <-chan Event {
-	ch := make(chan Event, 64)
-	go func() {
-		defer close(ch)
-		runLoopWithMessages(ctx, cfg, messages, ch)
-	}()
-	return ch
-}
-
-func runLoopWithMessages(ctx context.Context, cfg Config, messages []message.Message, ch chan<- Event) {
-	state := &State{
-		Messages:  messages,
-		TurnCount: 0,
-	}
-
-	toolSchemas := ToolSchemas(cfg.Registry)
-
-	for {
-		if ctx.Err() != nil {
-			ch <- Event{Type: "error", Error: ctx.Err()}
-			return
-		}
-		if cfg.MaxTurns > 0 && state.TurnCount >= cfg.MaxTurns {
-			ch <- Event{Type: "turn_complete"}
-			return
-		}
-		state.TurnCount++
-
-		// Microcompact + auto compact (same as runLoop)
-		state.Messages = compact.Microcompact(state.Messages, 10)
-		if cfg.AutoCompactThreshold > 0 {
-			tokenCount := token.EstimateMessages(state.Messages)
-			if tokenCount > cfg.AutoCompactThreshold {
-				compactCfg := compact.CompactConfig{
-					Provider:  cfg.Provider,
-					Model:     cfg.Model,
-					MaxTokens: 8192,
-				}
-				result, err := compact.Compact(ctx, compactCfg, state.Messages, "")
-				if err == nil {
-					state.Messages = result.NewMessages
-					ch <- Event{Type: "compacted", Message: &message.Message{
-						Role: message.RoleSystem,
-						Content: []message.ContentBlock{{
-							Type: message.BlockText,
-							Text: &message.TextBlock{Text: fmt.Sprintf(
-								"Auto-compacted: %d → %d tokens",
-								result.PreCompactTokens,
-								result.PostCompactTokens,
-							)},
-						}},
-					}}
-				}
-			}
-		}
-
-		req := provider.ChatRequest{
-			Messages:     state.Messages,
-			SystemPrompt: cfg.SystemPrompt,
-			Tools:        toolSchemas,
-			Model:        cfg.Model,
-			MaxTokens:    cfg.MaxTokens,
-		}
-
-		streamCh, err := cfg.Provider.StreamChat(ctx, req)
-		if err != nil {
-			ch <- Event{Type: "error", Error: fmt.Errorf("provider error: %w", err)}
-			return
-		}
-
-		var assistantMsg *message.Message
-		var toolUseBlocks []*message.ToolUseBlock
-
-		for evt := range streamCh {
-			switch evt.Type {
-			case "text_delta":
-				ch <- Event{Type: "text_delta", Delta: evt.Delta}
-			case "thinking_delta":
-				ch <- Event{Type: "thinking_delta", Delta: evt.Delta}
-			case "tool_use":
-				ch <- Event{Type: "tool_use", ToolName: evt.ToolUse.Name, ToolInput: string(evt.ToolUse.Input)}
-				toolUseBlocks = append(toolUseBlocks, evt.ToolUse)
-			case "message_complete":
-				assistantMsg = evt.Message
-				ch <- Event{Type: "message_complete", Message: evt.Message}
-			case "error":
-				ch <- Event{Type: "error", Error: evt.Error}
-				return
-			}
-		}
-
-		if ctx.Err() != nil {
-			for _, tu := range toolUseBlocks {
-				state.Messages = append(state.Messages,
-					message.NewToolResultMessage(tu.ID, "Interrupted by user", true))
-			}
-			ch <- Event{Type: "error", Error: ctx.Err()}
-			return
-		}
-
-		if assistantMsg == nil {
-			ch <- Event{Type: "error", Error: fmt.Errorf("no assistant message received")}
-			return
-		}
-
-		state.Messages = append(state.Messages, *assistantMsg)
-
-		if len(toolUseBlocks) == 0 {
-			ch <- Event{Type: "turn_complete"}
-			return
-		}
-
-		results := executeTools(ctx, cfg.Registry, toolUseBlocks)
-		for _, r := range results {
-			state.Messages = append(state.Messages, r.msg)
-			ch <- Event{Type: "tool_result", ToolResult: &r.result, ToolName: r.toolName}
-		}
 	}
 }
