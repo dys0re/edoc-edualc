@@ -5,24 +5,39 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
+)
+
+// ShellType controls which shell is used to execute commands.
+type ShellType string
+
+const (
+	ShellAuto       ShellType = ""           // auto-detect: powershell > bash > cmd on Windows, bash on Unix
+	ShellPowerShell ShellType = "powershell" // pwsh or powershell
+	ShellBash       ShellType = "bash"       // bash (Git Bash on Windows)
+	ShellCmd        ShellType = "cmd"        // cmd.exe (Windows only)
 )
 
 type BashTool struct {
 	workDir string
+	shell   ShellType
 }
 
-func NewBashTool(workDir string) *BashTool {
-	return &BashTool{workDir: workDir}
+func NewBashTool(workDir string, shell ShellType) *BashTool {
+	return &BashTool{workDir: workDir, shell: shell}
 }
 
 func (t *BashTool) Name() string { return "Bash" }
 
 func (t *BashTool) Description() string {
-	return "Execute a bash command and return its output."
+	return "Execute a command and return its output."
 }
 
 func (t *BashTool) InputSchema() map[string]interface{} {
@@ -31,7 +46,7 @@ func (t *BashTool) InputSchema() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"command": map[string]interface{}{
 				"type":        "string",
-				"description": "The bash command to execute",
+				"description": "The command to execute",
 			},
 			"timeout": map[string]interface{}{
 				"type":        "integer",
@@ -65,18 +80,12 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		// Use bash if available (Git Bash, WSL), fall back to cmd
-		if _, err := exec.LookPath("bash"); err == nil {
-			cmd = exec.CommandContext(ctx, "bash", "-c", in.Command)
-		} else {
-			cmd = exec.CommandContext(ctx, "cmd", "/C", in.Command)
-		}
-	} else {
-		cmd = exec.CommandContext(ctx, "bash", "-c", in.Command)
+	shell := t.shell
+	if shell == ShellAuto {
+		shell = detectShell()
 	}
 
+	cmd := buildCommand(ctx, shell, in.Command)
 	cmd.Dir = t.workDir
 
 	var stdout, stderr bytes.Buffer
@@ -85,35 +94,106 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 
 	err := cmd.Run()
 
-	var output strings.Builder
-	if stdout.Len() > 0 {
-		output.WriteString(stdout.String())
-	}
-	if stderr.Len() > 0 {
-		if output.Len() > 0 {
-			output.WriteString("\n")
-		}
-		output.WriteString(stderr.String())
+	outStr := decodeOutput(stdout.Bytes())
+	errStr := decodeOutput(stderr.Bytes())
+
+	var output string
+	if outStr != "" && errStr != "" {
+		output = outStr + "\n" + errStr
+	} else if outStr != "" {
+		output = outStr
+	} else if errStr != "" {
+		output = errStr
 	}
 
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return &Result{Content: fmt.Sprintf("Command timed out after %v\n%s", timeout, output.String()), IsError: true}, nil
+			return &Result{Content: fmt.Sprintf("Command timed out after %v\n%s", timeout, output), IsError: true}, nil
 		}
-		// Non-zero exit code — still return output, mark as error
-		content := output.String()
-		if content == "" {
-			content = err.Error()
+		if output == "" {
+			output = err.Error()
 		}
-		return &Result{Content: content, IsError: true}, nil
+		return &Result{Content: output, IsError: true}, nil
 	}
 
-	content := output.String()
-	if content == "" {
-		content = "(no output)"
+	if output == "" {
+		output = "(no output)"
 	}
-	return &Result{Content: content}, nil
+	return &Result{Content: output}, nil
 }
 
 func (t *BashTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *BashTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+
+// buildCommand creates the exec.Cmd for the given shell type.
+func buildCommand(ctx context.Context, shell ShellType, command string) *exec.Cmd {
+	switch shell {
+	case ShellPowerShell:
+		// pwsh (PowerShell 7+) preferred, fall back to Windows PowerShell
+		if _, err := exec.LookPath("pwsh"); err == nil {
+			return exec.CommandContext(ctx, "pwsh", "-NoProfile", "-Command", command)
+		}
+		return exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", command)
+	case ShellBash:
+		return exec.CommandContext(ctx, "bash", "-c", command)
+	case ShellCmd:
+		return exec.CommandContext(ctx, "cmd", "/C", command)
+	default:
+		// Unix default
+		return exec.CommandContext(ctx, "bash", "-c", command)
+	}
+}
+
+// detectShell picks the best available shell on the current OS.
+// Windows: pwsh > powershell > bash > cmd
+// Unix: bash
+func detectShell() ShellType {
+	if runtime.GOOS != "windows" {
+		return ShellBash
+	}
+	if _, err := exec.LookPath("pwsh"); err == nil {
+		return ShellPowerShell
+	}
+	if _, err := exec.LookPath("powershell"); err == nil {
+		return ShellPowerShell
+	}
+	if _, err := exec.LookPath("bash"); err == nil {
+		return ShellBash
+	}
+	return ShellCmd
+}
+
+// decodeOutput decodes command output bytes to a UTF-8 string.
+// On Windows, command output is often GBK (CP936) on Chinese systems.
+// Strategy: if bytes are valid UTF-8, use as-is; otherwise try GBK → UTF-8.
+func decodeOutput(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	if isValidUTF8(data) {
+		return string(data)
+	}
+	decoded, err := decodeGBK(data)
+	if err == nil {
+		return decoded
+	}
+	return string(data)
+}
+
+func isValidUTF8(data []byte) bool {
+	for _, b := range string(data) {
+		if b == '\uFFFD' {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeGBK(data []byte) (string, error) {
+	reader := transform.NewReader(bytes.NewReader(data), simplifiedchinese.GBK.NewDecoder())
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
+}

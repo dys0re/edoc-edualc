@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
+	"github.com/dysorder/edoc-edualc/backend/internal/token"
 )
 
 // Run executes the agent loop. Maps to query.ts:241 queryLoop.
@@ -43,6 +45,40 @@ func runLoop(ctx context.Context, cfg Config, userPrompt string, ch chan<- Event
 		}
 
 		state.TurnCount++
+
+		// Microcompact: clear old tool_result content (zero API cost)
+		// Maps to query.ts:414 deps.microcompact call
+		state.Messages = compact.Microcompact(state.Messages, 10)
+
+		// Auto compact: if token count exceeds threshold, summarize
+		// Maps to query.ts:454 deps.autocompact call
+		if cfg.AutoCompactThreshold > 0 {
+			tokenCount := token.EstimateMessages(state.Messages)
+			if tokenCount > cfg.AutoCompactThreshold {
+				compactCfg := compact.CompactConfig{
+					Provider:  cfg.Provider,
+					Model:     cfg.Model,
+					MaxTokens: 8192,
+				}
+				result, err := compact.Compact(ctx, compactCfg, state.Messages, "")
+				if err == nil {
+					state.Messages = result.NewMessages
+					ch <- Event{Type: "compacted", Message: &message.Message{
+						Role: message.RoleSystem,
+						Content: []message.ContentBlock{{
+							Type: message.BlockText,
+							Text: &message.TextBlock{Text: fmt.Sprintf(
+								"Auto-compacted: %d → %d tokens",
+								result.PreCompactTokens,
+								result.PostCompactTokens,
+							)},
+						}},
+					}}
+				}
+				// If compact fails, continue with current messages —
+				// the API may still accept them or return prompt_too_long
+			}
+		}
 
 		// Call the provider
 		req := provider.ChatRequest{
@@ -233,6 +269,34 @@ func runLoopWithMessages(ctx context.Context, cfg Config, messages []message.Mes
 			return
 		}
 		state.TurnCount++
+
+		// Microcompact + auto compact (same as runLoop)
+		state.Messages = compact.Microcompact(state.Messages, 10)
+		if cfg.AutoCompactThreshold > 0 {
+			tokenCount := token.EstimateMessages(state.Messages)
+			if tokenCount > cfg.AutoCompactThreshold {
+				compactCfg := compact.CompactConfig{
+					Provider:  cfg.Provider,
+					Model:     cfg.Model,
+					MaxTokens: 8192,
+				}
+				result, err := compact.Compact(ctx, compactCfg, state.Messages, "")
+				if err == nil {
+					state.Messages = result.NewMessages
+					ch <- Event{Type: "compacted", Message: &message.Message{
+						Role: message.RoleSystem,
+						Content: []message.ContentBlock{{
+							Type: message.BlockText,
+							Text: &message.TextBlock{Text: fmt.Sprintf(
+								"Auto-compacted: %d → %d tokens",
+								result.PreCompactTokens,
+								result.PostCompactTokens,
+							)},
+						}},
+					}}
+				}
+			}
+		}
 
 		req := provider.ChatRequest{
 			Messages:     state.Messages,

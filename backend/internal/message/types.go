@@ -21,20 +21,22 @@ type Message struct {
 // ContentBlock is a polymorphic block within a message.
 // Only one of the fields will be non-nil.
 type ContentBlock struct {
-	Type       BlockType        `json:"type"`
-	Text       *TextBlock       `json:"text,omitempty"`
-	ToolUse    *ToolUseBlock    `json:"tool_use,omitempty"`
-	ToolResult *ToolResultBlock `json:"tool_result,omitempty"`
-	Thinking   *ThinkingBlock   `json:"thinking,omitempty"`
+	Type             BlockType             `json:"type"`
+	Text             *TextBlock            `json:"text,omitempty"`
+	ToolUse          *ToolUseBlock         `json:"tool_use,omitempty"`
+	ToolResult       *ToolResultBlock      `json:"tool_result,omitempty"`
+	Thinking         *ThinkingBlock        `json:"thinking,omitempty"`
+	CompactBoundary  *CompactBoundaryBlock `json:"compact_boundary,omitempty"`
 }
 
 type BlockType string
 
 const (
-	BlockText       BlockType = "text"
-	BlockToolUse    BlockType = "tool_use"
-	BlockToolResult BlockType = "tool_result"
-	BlockThinking   BlockType = "thinking"
+	BlockText            BlockType = "text"
+	BlockToolUse         BlockType = "tool_use"
+	BlockToolResult      BlockType = "tool_result"
+	BlockThinking        BlockType = "thinking"
+	BlockCompactBoundary BlockType = "compact_boundary"
 )
 
 type TextBlock struct {
@@ -61,6 +63,13 @@ type ThinkingBlock struct {
 	Model     string `json:"model,omitempty"`
 }
 
+// CompactBoundaryBlock marks a compaction boundary in the message history.
+// Maps to Claude Code's SystemCompactBoundaryMessage.
+type CompactBoundaryBlock struct {
+	Trigger    string `json:"trigger"`     // "auto" | "manual"
+	TokenCount int    `json:"token_count"` // pre-compact token count
+}
+
 // --- Constructors ---
 
 func NewTextBlock(text string) ContentBlock {
@@ -81,6 +90,19 @@ func NewUserMessage(text string) Message {
 
 func NewToolResultMessage(toolUseID, content string, isError bool) Message {
 	return Message{Role: RoleUser, Content: []ContentBlock{NewToolResultBlock(toolUseID, content, isError)}}
+}
+
+func NewCompactBoundaryMessage(trigger string, tokenCount int) Message {
+	return Message{
+		Role: RoleSystem,
+		Content: []ContentBlock{{
+			Type: BlockCompactBoundary,
+			CompactBoundary: &CompactBoundaryBlock{
+				Trigger:    trigger,
+				TokenCount: tokenCount,
+			},
+		}},
+	}
 }
 
 // ExtractToolUseBlocks returns all tool_use blocks from a message.

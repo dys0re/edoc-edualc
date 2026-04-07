@@ -17,6 +17,7 @@ func NewRouter(p provider.Provider, workDir string) *gin.Engine {
 	api := r.Group("/api")
 	{
 		api.POST("/chat", h.ChatSSE)
+		api.POST("/compact", h.CompactSSE)
 		api.GET("/models", h.Models)
 	}
 

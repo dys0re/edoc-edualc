@@ -14,6 +14,10 @@ type Config struct {
 	Model        string
 	MaxTokens    int
 	MaxTurns     int // 0 = unlimited
+
+	// AutoCompactThreshold is the token count at which auto-compact triggers.
+	// 0 = disabled. Maps to autoCompact.ts:getAutoCompactThreshold.
+	AutoCompactThreshold int
 }
 
 // State is the mutable state carried between loop iterations.

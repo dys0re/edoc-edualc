@@ -34,10 +34,11 @@ func (r *Registry) All() []Tool {
 // DefaultRegistry creates a registry with all built-in tools.
 func DefaultRegistry(workDir string) *Registry {
 	r := NewRegistry()
-	r.Register(NewBashTool(workDir))
+	r.Register(NewBashTool(workDir, ShellAuto))
 	r.Register(NewReadTool())
 	r.Register(NewWriteTool())
 	r.Register(NewGlobTool())
 	r.Register(NewGrepTool())
+	r.Register(NewEditTool())
 	return r
 }
