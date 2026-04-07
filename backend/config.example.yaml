@@ -29,6 +29,16 @@ agent:
 tools:
   work_dir: "."       # 工具工作目录 (EDOC_TOOLS_WORK_DIR)
   shell: auto         # Shell: auto / powershell / bash / cmd (EDOC_TOOLS_SHELL)
+  memory_dir: ""      # 记忆存储目录，空=自动推导 ~/.edoc/projects/<path>/memory/ (EDOC_TOOLS_MEMORY_DIR)
+
+database:
+  url: ""             # 完整连接串，优先级最高 (DATABASE_URL)
+  host: localhost     # PG 主机 (EDOC_DATABASE_HOST)
+  port: 5432          # PG 端口 (EDOC_DATABASE_PORT)
+  user: edoc          # PG 用户 (EDOC_DATABASE_USER)
+  password: ""        # PG 密码 (EDOC_DATABASE_PASSWORD)
+  dbname: edoc        # PG 数据库名 (EDOC_DATABASE_DBNAME)
+  sslmode: disable    # SSL 模式: disable / require / verify-full (EDOC_DATABASE_SSLMODE)
 
 log:
   level: info         # 日志级别: debug / info / warn / error (EDOC_LOG_LEVEL)

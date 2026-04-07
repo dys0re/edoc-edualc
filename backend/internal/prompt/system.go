@@ -8,9 +8,14 @@ import (
 	"strings"
 )
 
-// BuildSystemPrompt assembles the system prompt for the agent.
-// Maps to the system prompt construction in main.tsx / context.ts.
+// BuildSystemPrompt assembles the system prompt for the agent (无记忆版).
 func BuildSystemPrompt(workDir string) string {
+	return BuildSystemPromptWithMemory(workDir, "")
+}
+
+// BuildSystemPromptWithMemory assembles the system prompt with optional memory section.
+// memorySection 为空则跳过记忆注入。
+func BuildSystemPromptWithMemory(workDir string, memorySection string) string {
 	var sb strings.Builder
 
 	sb.WriteString("You are an AI assistant that helps users with software engineering tasks. ")
@@ -35,6 +40,11 @@ func BuildSystemPrompt(workDir string) string {
 	sb.WriteString("- Read files before modifying them\n")
 	sb.WriteString("- Be concise and direct\n")
 	sb.WriteString("- Do not add features beyond what was asked\n")
+
+	// 注入记忆
+	if memorySection != "" {
+		sb.WriteString(memorySection)
+	}
 
 	// Load CLAUDE.md if present
 	claudeMd := loadClaudeMd(workDir)

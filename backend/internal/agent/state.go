@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
@@ -23,6 +24,9 @@ type Config struct {
 	// Same provider, different model (e.g., sonnet → haiku).
 	// Empty = no fallback. Maps to query.ts:188 fallbackModel.
 	ModelBackup string
+
+	// MemoryStore is the PG-backed memory store. nil = memory disabled.
+	MemoryStore *memory.Store
 }
 
 // State is the mutable state carried between loop iterations.

@@ -17,6 +17,7 @@ type Config struct {
 	OpenAI   OpenAIConfig   `mapstructure:"openai"`
 	Agent    AgentConfig    `mapstructure:"agent"`
 	Tools    ToolsConfig    `mapstructure:"tools"`
+	Database DatabaseConfig `mapstructure:"database"`
 	Log      LogConfig      `mapstructure:"log"`
 }
 
@@ -48,8 +49,28 @@ type AgentConfig struct {
 }
 
 type ToolsConfig struct {
-	WorkDir string `mapstructure:"work_dir"` // 工作目录
-	Shell   string `mapstructure:"shell"`    // auto / powershell / bash / cmd
+	WorkDir   string `mapstructure:"work_dir"`   // 工作目录
+	Shell     string `mapstructure:"shell"`      // auto / powershell / bash / cmd
+	MemoryDir string `mapstructure:"memory_dir"` // 记忆目录，空=自动推导 ~/.edoc/projects/<path>/memory/
+}
+
+type DatabaseConfig struct {
+	URL      string `mapstructure:"url"`      // 完整连接串，优先级最高 (DATABASE_URL)
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	DBName   string `mapstructure:"dbname"`
+	SSLMode  string `mapstructure:"sslmode"`
+}
+
+// DSN 返回 PostgreSQL 连接串。URL 优先，否则从字段拼接。
+func (d DatabaseConfig) DSN() string {
+	if d.URL != "" {
+		return d.URL
+	}
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+		d.User, d.Password, d.Host, d.Port, d.DBName, d.SSLMode)
 }
 
 type LogConfig struct {
@@ -90,6 +111,8 @@ func Load(configFile string) (*Config, error) {
 	_ = v.BindEnv("provider.model", "EDOC_MODEL")
 	_ = v.BindEnv("provider.default", "EDOC_PROVIDER")
 	_ = v.BindEnv("server.port", "EDOC_PORT")
+	// 数据库连接支持 DATABASE_URL（对标 Prisma/Drizzle 风格）
+	_ = v.BindEnv("database.url", "DATABASE_URL")
 
 	// 读配置文件（不存在不报错，纯环境变量也能跑）
 	if err := v.ReadInConfig(); err != nil {
@@ -129,6 +152,14 @@ func setDefaults(v *viper.Viper) {
 	// tools
 	v.SetDefault("tools.work_dir", ".")
 	v.SetDefault("tools.shell", "auto")
+
+	// database
+	v.SetDefault("database.host", "localhost")
+	v.SetDefault("database.port", 5432)
+	v.SetDefault("database.user", "edoc")
+	v.SetDefault("database.password", "")
+	v.SetDefault("database.dbname", "edoc")
+	v.SetDefault("database.sslmode", "disable")
 
 	// log
 	v.SetDefault("log.level", "info")

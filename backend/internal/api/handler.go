@@ -9,6 +9,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/agent"
 	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/config"
+	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
@@ -27,10 +28,11 @@ type Handler struct {
 	defaultProvider provider.Provider
 	cfg            *config.Config
 	workDir        string
+	memoryStore    *memory.Store
 }
 
-func NewHandler(p provider.Provider, cfg *config.Config, workDir string) *Handler {
-	return &Handler{defaultProvider: p, cfg: cfg, workDir: workDir}
+func NewHandler(p provider.Provider, cfg *config.Config, workDir string, memoryStore *memory.Store) *Handler {
+	return &Handler{defaultProvider: p, cfg: cfg, workDir: workDir, memoryStore: memoryStore}
 }
 
 // ChatSSE handles POST /api/chat with Server-Sent Events streaming.
