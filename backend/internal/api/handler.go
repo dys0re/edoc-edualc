@@ -13,6 +13,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
+	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/dysorder/edoc-edualc/backend/internal/token"
 	"github.com/gin-gonic/gin"
@@ -29,13 +30,21 @@ type Handler struct {
 	cfg            *config.Config
 	workDir        string
 	memoryStore    *memory.Store
+	sessionStore   *session.Store
 }
 
-func NewHandler(p provider.Provider, cfg *config.Config, workDir string, memoryStore *memory.Store) *Handler {
-	return &Handler{defaultProvider: p, cfg: cfg, workDir: workDir, memoryStore: memoryStore}
+func NewHandler(p provider.Provider, cfg *config.Config, workDir string, memoryStore *memory.Store, sessionStore *session.Store) *Handler {
+	return &Handler{
+		defaultProvider: p,
+		cfg:            cfg,
+		workDir:        workDir,
+		memoryStore:    memoryStore,
+		sessionStore:   sessionStore,
+	}
 }
 
 // ChatSSE handles POST /api/chat with Server-Sent Events streaming.
+// Stateless: each request is an isolated conversation.
 func (h *Handler) ChatSSE(c *gin.Context) {
 	var req ChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -48,11 +57,14 @@ func (h *Handler) ChatSSE(c *gin.Context) {
 
 	reg := tool.DefaultRegistry(h.workDir)
 	cfg := agent.Config{
-		Provider:     p,
-		Registry:     reg,
-		SystemPrompt: prompt.BuildSystemPrompt(h.workDir),
-		Model:        model,
-		MaxTokens:    8192,
+		Provider:           p,
+		Registry:           reg,
+		SystemPrompt:       prompt.BuildSystemPrompt(h.workDir),
+		Model:              model,
+		MaxTokens:          8192,
+		PermissionMode:     tool.ParsePermissionMode(h.cfg.Tools.PermissionMode),
+		AllowRules:         h.cfg.Tools.AllowRules,
+		// API mode: no interactive callback — non-bypass tools are denied
 	}
 
 	ctx, cancel := context.WithCancel(c.Request.Context())
@@ -60,6 +72,194 @@ func (h *Handler) ChatSSE(c *gin.Context) {
 
 	eventCh := agent.Run(ctx, cfg, req.Prompt)
 
+	h.sseResponse(c, ctx, eventCh)
+}
+
+// --- Session endpoints ---
+
+type CreateSessionRequest struct {
+	Model string `json:"model,omitempty"`
+}
+
+// CreateSession handles POST /api/sessions.
+func (h *Handler) CreateSession(c *gin.Context) {
+	if h.sessionStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	var req CreateSessionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		// Body is optional for create
+		req = CreateSessionRequest{}
+	}
+
+	model := req.Model
+	if model == "" {
+		model = h.cfg.Provider.Model
+	}
+
+	projectKey := memory.SanitizeProjectKey(h.workDir)
+	sess, err := h.sessionStore.Create(c.Request.Context(), "", projectKey, model)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, sess)
+}
+
+// ListSessions handles GET /api/sessions.
+func (h *Handler) ListSessions(c *gin.Context) {
+	if h.sessionStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	projectKey := memory.SanitizeProjectKey(h.workDir)
+	sessions, err := h.sessionStore.List(c.Request.Context(), "", projectKey, 50)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"sessions": sessions})
+}
+
+// GetSession handles GET /api/sessions/:id.
+func (h *Handler) GetSession(c *gin.Context) {
+	if h.sessionStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	id := c.Param("id")
+	sess, err := h.sessionStore.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+
+	msgs, err := h.sessionStore.LoadMessages(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"session":  sess,
+		"messages": msgs,
+	})
+}
+
+// DeleteSession handles DELETE /api/sessions/:id.
+func (h *Handler) DeleteSession(c *gin.Context) {
+	if h.sessionStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	id := c.Param("id")
+	if err := h.sessionStore.Delete(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+type UpdateSessionRequest struct {
+	Title string `json:"title,omitempty"`
+}
+
+// UpdateSession handles PATCH /api/sessions/:id.
+func (h *Handler) UpdateSession(c *gin.Context) {
+	if h.sessionStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	var req UpdateSessionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	id := c.Param("id")
+	if req.Title != "" {
+		if err := h.sessionStore.UpdateTitle(c.Request.Context(), id, req.Title); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "updated"})
+}
+
+// SessionChatSSE handles POST /api/sessions/:id/chat with Server-Sent Events.
+// Stateful: loads history from PG, appends new messages, persists after completion.
+func (h *Handler) SessionChatSSE(c *gin.Context) {
+	if h.sessionStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	id := c.Param("id")
+
+	// Verify session exists
+	_, err := h.sessionStore.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+
+	var req ChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Load existing messages
+	msgs, err := h.sessionStore.LoadMessages(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Append new user message to history
+	msgs = append(msgs, message.NewUserMessage(req.Prompt))
+
+	model := req.Model
+	if model == "" {
+		model = h.cfg.Provider.Model
+	}
+
+	p := h.defaultProvider
+	reg := tool.DefaultRegistry(h.workDir)
+	cfg := agent.Config{
+		Provider:           p,
+		Registry:           reg,
+		SystemPrompt:       prompt.BuildSystemPrompt(h.workDir),
+		Model:              model,
+		MaxTokens:          8192,
+		SessionStore:       h.sessionStore,
+		SessionID:          id,
+		PermissionMode:     tool.ParsePermissionMode(h.cfg.Tools.PermissionMode),
+		AllowRules:         h.cfg.Tools.AllowRules,
+	}
+
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+
+	eventCh := agent.RunWithMessages(ctx, cfg, msgs)
+
+	h.sseResponse(c, ctx, eventCh)
+}
+
+// --- Shared helpers ---
+
+// sseResponse writes SSE events from the channel to the HTTP response.
+func (h *Handler) sseResponse(c *gin.Context, ctx context.Context, eventCh <-chan agent.Event) {
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
@@ -113,6 +313,11 @@ func sseEvent(evt agent.Event) string {
 		if evt.Message != nil {
 			payload["message"] = evt.Message
 		}
+	case "warning":
+		payload["delta"] = evt.Delta
+	case "permission_request":
+		payload["tool_name"] = evt.PermissionToolName
+		payload["description"] = evt.PermissionDesc
 	}
 	b, _ := json.Marshal(payload)
 	return string(b)

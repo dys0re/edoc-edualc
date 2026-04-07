@@ -91,3 +91,6 @@ func (t *ReadTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 
 func (t *ReadTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *ReadTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+func (t *ReadTool) NeedsApproval(_ json.RawMessage) bool     { return false }
+func (t *ReadTool) PermissionDescription(_ json.RawMessage) string { return "" }
+func (t *ReadTool) IsFileEdit(_ json.RawMessage) bool        { return false }

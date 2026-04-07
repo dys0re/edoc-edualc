@@ -129,6 +129,13 @@ func (t *EditTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 
 func (t *EditTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *EditTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *EditTool) NeedsApproval(_ json.RawMessage) bool     { return true }
+func (t *EditTool) PermissionDescription(input json.RawMessage) string {
+	var parsed struct{ FilePath string `json:"file_path"` }
+	json.Unmarshal(input, &parsed)
+	return "Edit file: " + parsed.FilePath
+}
+func (t *EditTool) IsFileEdit(_ json.RawMessage) bool { return true }
 
 // findActualString tries multiple matching strategies to locate old_string in content.
 // Strategies in order:

@@ -13,6 +13,13 @@ type Tool interface {
 	Execute(ctx context.Context, input json.RawMessage) (*Result, error)
 	IsReadOnly(input json.RawMessage) bool
 	IsConcurrencySafe(input json.RawMessage) bool
+	// NeedsApproval returns true if this tool invocation requires user approval.
+	NeedsApproval(input json.RawMessage) bool
+	// PermissionDescription returns a human-readable description for the permission prompt.
+	PermissionDescription(input json.RawMessage) string
+	// IsFileEdit returns true if this tool modifies files (Write/Edit).
+	// Used by accept-edits mode to auto-approve file changes.
+	IsFileEdit(input json.RawMessage) bool
 }
 
 // Result is what a tool returns after execution.

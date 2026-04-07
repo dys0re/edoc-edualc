@@ -124,6 +124,13 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 
 func (t *BashTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *BashTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *BashTool) NeedsApproval(_ json.RawMessage) bool     { return true }
+func (t *BashTool) PermissionDescription(input json.RawMessage) string {
+	var parsed struct{ Command string `json:"command"` }
+	json.Unmarshal(input, &parsed)
+	return "Execute command: " + parsed.Command
+}
+func (t *BashTool) IsFileEdit(_ json.RawMessage) bool { return false }
 
 // buildCommand creates the exec.Cmd for the given shell type.
 func buildCommand(ctx context.Context, shell ShellType, command string) *exec.Cmd {

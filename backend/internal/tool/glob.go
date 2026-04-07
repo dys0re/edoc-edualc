@@ -80,3 +80,6 @@ func (t *GlobTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 
 func (t *GlobTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *GlobTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+func (t *GlobTool) NeedsApproval(_ json.RawMessage) bool     { return false }
+func (t *GlobTool) PermissionDescription(_ json.RawMessage) string { return "" }
+func (t *GlobTool) IsFileEdit(_ json.RawMessage) bool        { return false }

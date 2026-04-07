@@ -123,3 +123,6 @@ func (t *GrepTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 
 func (t *GrepTool) IsReadOnly(_ json.RawMessage) bool        { return true }
 func (t *GrepTool) IsConcurrencySafe(_ json.RawMessage) bool { return true }
+func (t *GrepTool) NeedsApproval(_ json.RawMessage) bool     { return false }
+func (t *GrepTool) PermissionDescription(_ json.RawMessage) string { return "" }
+func (t *GrepTool) IsFileEdit(_ json.RawMessage) bool        { return false }

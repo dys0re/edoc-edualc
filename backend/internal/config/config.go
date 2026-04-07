@@ -49,9 +49,11 @@ type AgentConfig struct {
 }
 
 type ToolsConfig struct {
-	WorkDir   string `mapstructure:"work_dir"`   // 工作目录
-	Shell     string `mapstructure:"shell"`      // auto / powershell / bash / cmd
-	MemoryDir string `mapstructure:"memory_dir"` // 记忆目录，空=自动推导 ~/.edoc/projects/<path>/memory/
+	WorkDir        string   `mapstructure:"work_dir"`        // 工作目录
+	Shell          string   `mapstructure:"shell"`           // auto / powershell / bash / cmd
+	MemoryDir      string   `mapstructure:"memory_dir"`      // 记忆目录，空=自动推导 ~/.edoc/projects/<path>/memory/
+	PermissionMode string   `mapstructure:"permission_mode"` // bypass / default / accept-edits / strict
+	AllowRules     []string `mapstructure:"allow_rules"`     // e.g. ["Read", "Bash:git *"]
 }
 
 type DatabaseConfig struct {
@@ -152,6 +154,7 @@ func setDefaults(v *viper.Viper) {
 	// tools
 	v.SetDefault("tools.work_dir", ".")
 	v.SetDefault("tools.shell", "auto")
+	v.SetDefault("tools.permission_mode", "bypass")
 
 	// database
 	v.SetDefault("database.host", "localhost")

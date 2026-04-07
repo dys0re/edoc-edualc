@@ -60,3 +60,10 @@ func (t *WriteTool) Execute(_ context.Context, input json.RawMessage) (*Result, 
 
 func (t *WriteTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *WriteTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
+func (t *WriteTool) NeedsApproval(_ json.RawMessage) bool     { return true }
+func (t *WriteTool) PermissionDescription(input json.RawMessage) string {
+	var parsed struct{ FilePath string `json:"file_path"` }
+	json.Unmarshal(input, &parsed)
+	return "Write file: " + parsed.FilePath
+}
+func (t *WriteTool) IsFileEdit(_ json.RawMessage) bool { return true }

@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
@@ -14,6 +16,8 @@ import (
 
 const (
 	maxOutputTokensRecoveryLimit = 3 // 截断续写最大恢复次数，对标 query.ts:164
+	maxServerErrorRetries        = 3 // 5xx 最大重试次数，对标 withRetry.ts:52
+	serverErrorBaseDelay         = 500 * time.Millisecond
 )
 
 // Run executes the agent loop with a new user prompt.
@@ -47,6 +51,12 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 	// 当前使用的模型（可能被 fallback 切换）
 	currentModel := cfg.Model
 
+	// 持久化：记录 loop 开始前的消息数量
+	prevMsgCount := len(state.Messages)
+
+	// 如果是 session resume，先持久化新追加的 user message
+	persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
+
 	for {
 		// ── 1. Context 取消检查 ──
 		if ctx.Err() != nil {
@@ -65,6 +75,7 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		}
 
 		state.TurnCount++
+		prevMsgCount = len(state.Messages)
 
 		// ── 3. Microcompact: 清空旧 tool_result 内容 ──
 		// 对标 query.ts:414 deps.microcompact call
@@ -83,6 +94,7 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 				result, err := compact.Compact(ctx, compactCfg, state.Messages, "")
 				if err == nil {
 					state.Messages = result.NewMessages
+					prevMsgCount = 0 // compact 后全部是新消息
 					ch <- Event{Type: "compacted", Message: &message.Message{
 						Role: message.RoleSystem,
 						Content: []message.ContentBlock{{
@@ -134,6 +146,7 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 				state.Messages = append(state.Messages,
 					message.NewToolResultMessage(tu.ID, "Interrupted by user", true))
 			}
+			persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
 			ch <- Event{Type: "error", Error: ctx.Err()}
 			return
 		}
@@ -156,6 +169,8 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 				Delta: fmt.Sprintf("Response truncated, auto-continuing (%d/%d)",
 					state.MaxOutputTokensRecoveryCount, maxOutputTokensRecoveryLimit),
 			}
+			// 持久化截断前的消息
+			persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
 			continue
 		}
 
@@ -168,8 +183,51 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 
 		// ── 9. 无 tool 调用 → 对话结束 ──
 		if len(toolUseBlocks) == 0 {
+			persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
 			ch <- Event{Type: "turn_complete"}
 			return
+		}
+
+
+		// Permission check
+		if cfg.PermissionMode != tool.PermissionBypass && cfg.PermissionCallback != nil {
+			var approved []*message.ToolUseBlock
+			for _, tu := range toolUseBlocks {
+				t, tErr := cfg.Registry.Get(tu.Name)
+				if tErr != nil {
+					approved = append(approved, tu)
+					continue
+				}
+				decision := tool.CheckPermission(cfg.PermissionMode, cfg.AllowRules, t, tu.Input)
+				switch decision {
+				case tool.DecisionAllow:
+					approved = append(approved, tu)
+				case tool.DecisionDeny:
+					state.Messages = append(state.Messages,
+						message.NewToolResultMessage(tu.ID, "Permission denied", true))
+					ch <- Event{Type: "tool_result", ToolName: tu.Name,
+						ToolResult: &tool.Result{Content: "Permission denied", IsError: true}}
+				case tool.DecisionAsk:
+					desc := t.PermissionDescription(tu.Input)
+					ch <- Event{Type: "permission_request",
+						PermissionToolName: tu.Name, PermissionDesc: desc}
+					allowed, cbErr := cfg.PermissionCallback(tu.Name, desc)
+					if cbErr != nil || !allowed {
+						state.Messages = append(state.Messages,
+							message.NewToolResultMessage(tu.ID, "Permission denied by user", true))
+						ch <- Event{Type: "tool_result", ToolName: tu.Name,
+							ToolResult: &tool.Result{Content: "Permission denied by user", IsError: true}}
+					} else {
+						approved = append(approved, tu)
+					}
+				}
+			}
+			toolUseBlocks = approved
+			if len(toolUseBlocks) == 0 {
+				persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
+				ch <- Event{Type: "turn_complete"}
+				return
+			}
 		}
 
 		// ── 10. 执行 tools ──
@@ -182,6 +240,23 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 
 		// Tool 执行成功，重置恢复计数
 		state.MaxOutputTokensRecoveryCount = 0
+
+		// 持久化本轮新增的所有消息（assistant + tool results）
+		persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
+	}
+}
+
+// persistNewMessages 持久化从 prevMsgCount 开始的新增消息到 session store。
+func persistNewMessages(ctx context.Context, cfg Config, state *State, prevMsgCount int, ch chan<- Event) {
+	if cfg.SessionStore == nil || cfg.SessionID == "" {
+		return
+	}
+	newMsgs := state.Messages[prevMsgCount:]
+	if len(newMsgs) == 0 {
+		return
+	}
+	if err := cfg.SessionStore.AppendMessages(ctx, cfg.SessionID, newMsgs); err != nil {
+		ch <- Event{Type: "warning", Delta: "failed to persist messages: " + err.Error()}
 	}
 }
 
@@ -271,12 +346,33 @@ func handleProviderError(ctx context.Context, cfg Config, state *State, ch chan<
 		ch <- Event{Type: "error", Error: provider.ErrPromptTooLong}
 		return false
 
-	case provider.ErrorAuth:
-		ch <- Event{Type: "error", Error: fmt.Errorf("authentication failed: %w", err)}
+	case provider.ErrorServer:
+		// 5xx server error → 指数退避重试
+		// 对标 withRetry.ts:getRetryDelay (base 500ms × 2^attempt + jitter)
+		if state.ServerErrorRetries < maxServerErrorRetries {
+			state.ServerErrorRetries++
+			attempt := state.ServerErrorRetries
+			delay := serverErrorBaseDelay * time.Duration(1<<attempt)
+			jitter := time.Duration(rand.Intn(250)) * time.Millisecond
+			delay += jitter
+
+			ch <- Event{
+				Type:  "warning",
+				Delta: fmt.Sprintf("Server error, retrying in %v (%d/%d)", delay, attempt, maxServerErrorRetries),
+			}
+
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(delay):
+				return true // retry
+			}
+		}
+		ch <- Event{Type: "error", Error: fmt.Errorf("server error after %d retries: %w", maxServerErrorRetries, err)}
 		return false
 
-	case provider.ErrorServer:
-		ch <- Event{Type: "error", Error: fmt.Errorf("server error: %w", err)}
+	case provider.ErrorAuth:
+		ch <- Event{Type: "error", Error: fmt.Errorf("authentication failed: %w", err)}
 		return false
 
 	default:
