@@ -32,7 +32,8 @@ func (r *Registry) All() []Tool {
 }
 
 // DefaultRegistry creates a registry with all built-in tools (no Agent tool).
-func DefaultRegistry(workDir string) *Registry {
+// webFetchProvider may be nil — WebFetch will return raw markdown without summarization.
+func DefaultRegistry(workDir string, webFetchProvider WebFetchProvider) *Registry {
 	r := NewRegistry()
 	r.Register(NewBashTool(workDir, ShellAuto))
 	r.Register(NewReadTool())
@@ -40,13 +41,14 @@ func DefaultRegistry(workDir string) *Registry {
 	r.Register(NewGlobTool())
 	r.Register(NewGrepTool())
 	r.Register(NewEditTool())
+	r.Register(&WebFetchTool{Provider: webFetchProvider})
 	return r
 }
 
 // DefaultRegistryWithAgent creates a registry with all built-in tools including Agent.
 // The resolver is wired in by the caller (typically agent.NewSubagentResolver).
-func DefaultRegistryWithAgent(workDir string, resolver AgentResolver) *Registry {
-	r := DefaultRegistry(workDir)
+func DefaultRegistryWithAgent(workDir string, webFetchProvider WebFetchProvider, resolver AgentResolver) *Registry {
+	r := DefaultRegistry(workDir, webFetchProvider)
 	r.Register(&AgentTool{Resolver: resolver})
 	return r
 }

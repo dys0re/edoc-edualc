@@ -161,6 +161,8 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	}
 
 	shell := parseShellType(cfg.Tools.Shell)
+	p := buildProvider(cfg)
+	webFetchProvider := tool.NewProviderWebFetch(p, cfg.Provider.ModelBackup)
 	reg := tool.NewRegistry()
 	reg.Register(tool.NewBashTool(workDir, shell))
 	reg.Register(tool.NewReadTool())
@@ -168,12 +170,13 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	reg.Register(tool.NewGlobTool())
 	reg.Register(tool.NewGrepTool())
 	reg.Register(tool.NewEditTool())
+	reg.Register(&tool.WebFetchTool{Provider: webFetchProvider})
 
 	memStore := buildMemoryStore(pool, workDir)
 	sessStore := buildSessionStore(pool)
 
 	agentCfg := agent.Config{
-		Provider:     buildProvider(cfg),
+		Provider:     p,
 		Registry:     reg,
 		SystemPrompt: buildSystemPrompt(cfg, workDir, memStore),
 		Model:        cfg.Provider.Model,

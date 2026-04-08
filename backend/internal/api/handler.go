@@ -55,7 +55,7 @@ func (h *Handler) ChatSSE(c *gin.Context) {
 	p := h.defaultProvider
 	model := req.Model
 
-	reg := tool.DefaultRegistry(h.workDir)
+	reg := tool.DefaultRegistry(h.workDir, tool.NewProviderWebFetch(p, h.cfg.Provider.ModelBackup))
 	cfg := agent.Config{
 		Provider:           p,
 		Registry:           reg,
@@ -235,7 +235,7 @@ func (h *Handler) SessionChatSSE(c *gin.Context) {
 	}
 
 	p := h.defaultProvider
-	reg := tool.DefaultRegistry(h.workDir)
+	reg := tool.DefaultRegistry(h.workDir, tool.NewProviderWebFetch(p, h.cfg.Provider.ModelBackup))
 	cfg := agent.Config{
 		Provider:           p,
 		Registry:           reg,
