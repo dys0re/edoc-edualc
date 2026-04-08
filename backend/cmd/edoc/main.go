@@ -12,6 +12,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/api"
 	"github.com/dysorder/edoc-edualc/backend/internal/config"
 	"github.com/dysorder/edoc-edualc/backend/internal/db"
+	"github.com/dysorder/edoc-edualc/backend/internal/mcp"
 	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
@@ -187,6 +188,27 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	skillReg := buildSkillRegistry(workDir)
 
 	reg.Register(&tool.SkillTool{Registry: skillReg})
+
+	// MCP: 连接所有配置的 server，注册发现的工具
+	if len(cfg.MCPServers) > 0 {
+		mcpMgr := mcp.NewManager()
+		mcpCfgs := make(map[string]mcp.ServerConfig, len(cfg.MCPServers))
+		for name, s := range cfg.MCPServers {
+			mcpCfgs[name] = mcp.ServerConfig{
+				Type:    s.Type,
+				Command: s.Command,
+				Args:    s.Args,
+				Env:     s.Env,
+				URL:     s.URL,
+			}
+		}
+		if errs := mcpMgr.Connect(context.Background(), mcpCfgs); len(errs) > 0 {
+			for name, err := range errs {
+				fmt.Fprintf(os.Stderr, "MCP server %q connect failed: %v\n", name, err)
+			}
+		}
+		mcp.RegisterTools(reg, mcpMgr)
+	}
 
 	agentCfg := agent.Config{
 		Provider:             p,

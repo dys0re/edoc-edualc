@@ -11,14 +11,15 @@ import (
 // 对标 Spring Boot application.yml，统一管理所有配置项。
 // Viper 加载优先级: 命令行 flag > 环境变量 > config.yaml > 默认值
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Provider ProviderConfig `mapstructure:"provider"`
-	Anthropic AnthropicConfig `mapstructure:"anthropic"`
-	OpenAI   OpenAIConfig   `mapstructure:"openai"`
-	Agent    AgentConfig    `mapstructure:"agent"`
-	Tools    ToolsConfig    `mapstructure:"tools"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Log      LogConfig      `mapstructure:"log"`
+	Server    ServerConfig             `mapstructure:"server"`
+	Provider  ProviderConfig           `mapstructure:"provider"`
+	Anthropic AnthropicConfig          `mapstructure:"anthropic"`
+	OpenAI    OpenAIConfig             `mapstructure:"openai"`
+	Agent     AgentConfig              `mapstructure:"agent"`
+	Tools     ToolsConfig              `mapstructure:"tools"`
+	Database  DatabaseConfig           `mapstructure:"database"`
+	Log       LogConfig                `mapstructure:"log"`
+	MCPServers map[string]MCPServerConfig `mapstructure:"mcp_servers"`
 }
 
 type ServerConfig struct {
@@ -77,6 +78,16 @@ func (d DatabaseConfig) DSN() string {
 
 type LogConfig struct {
 	Level string `mapstructure:"level"` // debug / info / warn / error
+}
+
+// MCPServerConfig describes a single MCP server connection.
+// Maps to Claude Code's mcpServers in settings.json.
+type MCPServerConfig struct {
+	Type    string   `mapstructure:"type"`    // "stdio" (default) or "sse"
+	Command string   `mapstructure:"command"` // stdio: executable
+	Args    []string `mapstructure:"args"`    // stdio: arguments
+	Env     []string `mapstructure:"env"`     // stdio: KEY=VALUE env vars
+	URL     string   `mapstructure:"url"`     // sse: server URL
 }
 
 // Load reads config from file + env vars + defaults.
