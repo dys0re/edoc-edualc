@@ -153,7 +153,7 @@ func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store) 
 	return prompt.BuildSystemPromptWithMemory(workDir, memorySection)
 }
 
-// buildAgentConfig 组装 agent.Config
+// buildAgentConfig 组装 agent.Config (with Agent tool wired in).
 func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, permCallback tool.PermissionCallback) agent.Config {
 	workDir := cfg.Tools.WorkDir
 	if workDir == "." {
@@ -172,7 +172,7 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	memStore := buildMemoryStore(pool, workDir)
 	sessStore := buildSessionStore(pool)
 
-	return agent.Config{
+	agentCfg := agent.Config{
 		Provider:     buildProvider(cfg),
 		Registry:     reg,
 		SystemPrompt: buildSystemPrompt(cfg, workDir, memStore),
@@ -188,6 +188,12 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 		AllowRules:           cfg.Tools.AllowRules,
 		PermissionCallback:   permCallback,
 	}
+
+	// Wire Agent tool with subagent resolver (references the config being built)
+	resolver := agent.NewSubagentResolver(agentCfg)
+	reg.Register(&tool.AgentTool{Resolver: resolver})
+
+	return agentCfg
 }
 
 // buildPermissionCallback creates a REPL permission callback that reads y/n from stdin.

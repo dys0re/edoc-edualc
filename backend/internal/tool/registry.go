@@ -31,7 +31,7 @@ func (r *Registry) All() []Tool {
 	return out
 }
 
-// DefaultRegistry creates a registry with all built-in tools.
+// DefaultRegistry creates a registry with all built-in tools (no Agent tool).
 func DefaultRegistry(workDir string) *Registry {
 	r := NewRegistry()
 	r.Register(NewBashTool(workDir, ShellAuto))
@@ -40,5 +40,13 @@ func DefaultRegistry(workDir string) *Registry {
 	r.Register(NewGlobTool())
 	r.Register(NewGrepTool())
 	r.Register(NewEditTool())
+	return r
+}
+
+// DefaultRegistryWithAgent creates a registry with all built-in tools including Agent.
+// The resolver is wired in by the caller (typically agent.NewSubagentResolver).
+func DefaultRegistryWithAgent(workDir string, resolver AgentResolver) *Registry {
+	r := DefaultRegistry(workDir)
+	r.Register(&AgentTool{Resolver: resolver})
 	return r
 }
