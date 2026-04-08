@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 
 	"github.com/dysorder/edoc-edualc/backend/internal/agent"
 	"github.com/dysorder/edoc-edualc/backend/internal/api"
+	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/config"
 	"github.com/dysorder/edoc-edualc/backend/internal/db"
+	"github.com/dysorder/edoc-edualc/backend/internal/hook"
 	"github.com/dysorder/edoc-edualc/backend/internal/mcp"
 	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
@@ -19,6 +22,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/dysorder/edoc-edualc/backend/internal/skill"
+	"github.com/dysorder/edoc-edualc/backend/internal/token"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -165,7 +169,7 @@ func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store, 
 }
 
 // buildAgentConfig 组装 agent.Config (with Agent tool wired in).
-func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, permCallback tool.PermissionCallback) agent.Config {
+func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback) agent.Config {
 	workDir := cfg.Tools.WorkDir
 	if workDir == "." {
 		workDir, _ = os.Getwd()
@@ -188,6 +192,23 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	skillReg := buildSkillRegistry(workDir)
 
 	reg.Register(&tool.SkillTool{Registry: skillReg})
+
+	// Plan mode tools
+	plansDir := cfg.Tools.PlansDir
+	if plansDir == "" {
+		home, _ := os.UserHomeDir()
+		plansDir = filepath.Join(home, ".edoc", "plans")
+	}
+	reg.Register(&tool.EnterPlanModeTool{PlansDir: plansDir})
+	reg.Register(&tool.ExitPlanModeTool{PlansDir: plansDir, PermissionCallback: permCallback})
+
+	// TodoWrite + AskUserQuestion
+	reg.Register(&tool.TodoWriteTool{})
+	reg.Register(&tool.AskUserQuestionTool{Callback: buildAskCallback(scanner)})
+
+	// Worktree tools
+	reg.Register(&tool.EnterWorktreeTool{WorkDir: workDir})
+	reg.Register(&tool.ExitWorktreeTool{})
 
 	// MCP: 连接所有配置的 server，注册发现的工具
 	if len(cfg.MCPServers) > 0 {
@@ -227,6 +248,19 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 		PermissionCallback:   permCallback,
 	}
 
+	// Hooks: 从 .edoc/settings.json 加载
+	hooksCfg, hookErr := hook.LoadSettings(workDir)
+	if hookErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: hooks config: %v\n", hookErr)
+	}
+	if len(hooksCfg) > 0 {
+		agentCfg.HookRunner = &hook.Runner{
+			Config:  hooksCfg,
+			WorkDir: workDir,
+			Shell:   cfg.Tools.Shell,
+		}
+	}
+
 	// Wire Agent tool with subagent resolver (references the config being built)
 	resolver := agent.NewSubagentResolver(agentCfg)
 	reg.Register(&tool.AgentTool{Resolver: resolver})
@@ -246,10 +280,22 @@ func buildPermissionCallback(scanner *bufio.Scanner) tool.PermissionCallback {
 	}
 }
 
+// buildAskCallback wraps a PermissionCallback into an AskUserQuestion callback.
+// Prints the question and reads a free-form answer from stdin.
+func buildAskCallback(scanner *bufio.Scanner) func(string) (string, error) {
+	return func(question string) (string, error) {
+		fmt.Printf("\n  [Question] %s\n  > ", question)
+		if !scanner.Scan() {
+			return "", nil
+		}
+		return strings.TrimSpace(scanner.Text()), nil
+	}
+}
+
 // runOnce executes a single prompt and exits. Maps to `claude -p "..."`.
 func runOnce(cfg *config.Config, pool *pgxpool.Pool, userPrompt string) {
 	scanner := bufio.NewScanner(os.Stdin)
-	agentCfg := buildAgentConfig(cfg, pool, "", buildPermissionCallback(scanner))
+	agentCfg := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -277,13 +323,14 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 	scanner := bufio.NewScanner(os.Stdin)
 	sessStore := buildSessionStore(pool)
 
+	workDir := cfg.Tools.WorkDir
+	if workDir == "." {
+		workDir, _ = os.Getwd()
+	}
+
 	// 创建或恢复会话
 	var currentSessionID string
 	if sessStore != nil {
-		workDir := cfg.Tools.WorkDir
-		if workDir == "." {
-			workDir, _ = os.Getwd()
-		}
 		projectKey := memory.SanitizeProjectKey(workDir)
 		sess, err := sessStore.Create(context.Background(), "", projectKey, cfg.Provider.Model)
 		if err != nil {
@@ -293,8 +340,10 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 		}
 	}
 
-	fmt.Println("edoc-edualc (type /quit to exit)")
-	fmt.Printf("model: %s, provider: %s\n", cfg.Provider.Model, cfg.Provider.Default)
+	currentModel := cfg.Provider.Model
+
+	fmt.Println("edoc-edualc (type /help for commands)")
+	fmt.Printf("model: %s, provider: %s\n", currentModel, cfg.Provider.Default)
 	if currentSessionID != "" {
 		fmt.Printf("session: %s\n", currentSessionID)
 	}
@@ -302,6 +351,9 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 		fmt.Println("db: connected")
 	}
 	fmt.Println()
+
+	// history tracks the current conversation for /compact and /cost
+	var history []message.Message
 
 	for {
 		fmt.Print("> ")
@@ -313,35 +365,110 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 			continue
 		}
 
-		// Handle commands
+		// ── Slash commands ──
 		if input == "/quit" || input == "/exit" {
 			break
 		}
 
-		if input == "/new" {
-			if sessStore != nil {
-				workDir := cfg.Tools.WorkDir
-				if workDir == "." {
-					workDir, _ = os.Getwd()
+		if input == "/help" {
+			fmt.Println("Commands:")
+			fmt.Println("  /new                  Start a new session")
+			fmt.Println("  /sessions             List saved sessions")
+			fmt.Println("  /resume <id>          Resume a saved session")
+			fmt.Println("  /clear                Clear conversation history")
+			fmt.Println("  /compact              Compact conversation context")
+			fmt.Println("  /model <name>         Switch model")
+			fmt.Println("  /cost                 Show token usage estimate")
+			fmt.Println("  /memory               Show loaded memory")
+			fmt.Println("  /quit, /exit          Exit")
+			continue
+		}
+
+		if input == "/clear" {
+			history = nil
+			fmt.Println("Conversation cleared.")
+			continue
+		}
+
+		if input == "/cost" {
+			est := token.EstimateMessages(history)
+			fmt.Printf("Estimated tokens in context: ~%d\n", est)
+			continue
+		}
+
+		if input == "/compact" {
+			if len(history) == 0 {
+				fmt.Println("Nothing to compact.")
+				continue
+			}
+			p := buildProvider(cfg)
+			compactCfg := compact.CompactConfig{
+				Provider:  p,
+				Model:     currentModel,
+				MaxTokens: 8192,
+			}
+			result, err := compact.Compact(context.Background(), compactCfg, history, "")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Compact error: %v\n", err)
+			} else {
+				history = result.NewMessages
+				fmt.Printf("Compacted: ~%d → ~%d tokens\n", result.PreCompactTokens, result.PostCompactTokens)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(input, "/model ") {
+			newModel := strings.TrimSpace(strings.TrimPrefix(input, "/model "))
+			if newModel == "" {
+				fmt.Fprintf(os.Stderr, "Usage: /model <model-name>\n")
+			} else {
+				currentModel = newModel
+				cfg.Provider.Model = newModel
+				fmt.Printf("Model switched to: %s\n", currentModel)
+			}
+			continue
+		}
+
+		if input == "/memory" {
+			memStore := buildMemoryStore(pool, workDir)
+			var section string
+			if memStore != nil {
+				section = memory.BuildMemoryPromptSectionPG(context.Background(), memStore)
+			}
+			if section == "" {
+				memDir := cfg.Tools.MemoryDir
+				if memDir == "" {
+					memDir = memory.GetMemoryDir(workDir)
 				}
+				section = memory.BuildMemoryPromptSection(memDir)
+			}
+			if section == "" {
+				fmt.Println("No memory loaded.")
+			} else {
+				fmt.Println(section)
+			}
+			continue
+		}
+
+		if input == "/new" {
+			history = nil
+			if sessStore != nil {
 				projectKey := memory.SanitizeProjectKey(workDir)
-				sess, err := sessStore.Create(context.Background(), "", projectKey, cfg.Provider.Model)
+				sess, err := sessStore.Create(context.Background(), "", projectKey, currentModel)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error creating session: %v\n", err)
 				} else {
 					currentSessionID = sess.ID
 					fmt.Printf("New session: %s\n", currentSessionID)
 				}
+			} else {
+				fmt.Println("New conversation started.")
 			}
 			continue
 		}
 
 		if input == "/sessions" {
 			if sessStore != nil {
-				workDir := cfg.Tools.WorkDir
-				if workDir == "." {
-					workDir, _ = os.Getwd()
-				}
 				projectKey := memory.SanitizeProjectKey(workDir)
 				sessions, err := sessStore.List(context.Background(), "", projectKey, 20)
 				if err != nil {
@@ -369,14 +496,8 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 				fmt.Println("Database not available.")
 				continue
 			}
-			// Verify session exists
 			sess, err := sessStore.Get(context.Background(), id)
 			if err != nil {
-				// Try partial ID match
-				workDir := cfg.Tools.WorkDir
-				if workDir == "." {
-					workDir, _ = os.Getwd()
-				}
 				projectKey := memory.SanitizeProjectKey(workDir)
 				sessions, listErr := sessStore.List(context.Background(), "", projectKey, 50)
 				if listErr != nil {
@@ -400,45 +521,78 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 			currentSessionID = sess.ID
 			fmt.Printf("Resumed session: %s\n", sess.ID)
 
-			// Load history and run with it
-			history, err := sessStore.LoadMessages(context.Background(), sess.ID)
+			loaded, err := sessStore.LoadMessages(context.Background(), sess.ID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error loading session: %v\n", err)
 				continue
 			}
+			history = loaded
 			fmt.Printf("Loaded %d messages from history.\n", len(history))
 
-			agentCfg := buildAgentConfig(cfg, pool, currentSessionID, buildPermissionCallback(scanner))
-			runAgentLoop(scanner, agentCfg, history)
+			agentCfg := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+			history = runAgentLoop(scanner, agentCfg, history)
 			continue
 		}
 
-		// Normal prompt
-		agentCfg := buildAgentConfig(cfg, pool, currentSessionID, buildPermissionCallback(scanner))
+		// ── Normal prompt ──
+		agentCfg := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+
+		// UserPromptSubmit hooks: 在用户提交 prompt 后、agent 执行前触发
+		if agentCfg.HookRunner != nil {
+			hookResult, _ := agentCfg.HookRunner.RunUserPromptSubmit(context.Background(), input)
+			if hookResult != nil && hookResult.Decision == "block" {
+				errMsg := "Blocked by UserPromptSubmit hook"
+				if len(hookResult.BlockingErrors) > 0 {
+					errMsg = hookResult.BlockingErrors[0]
+				}
+				fmt.Fprintf(os.Stderr, "\n[hook blocked]: %s\n", errMsg)
+				continue
+			}
+		}
+
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 
-		for evt := range agent.Run(ctx, agentCfg, input) {
-			switch evt.Type {
-			case "text_delta":
-				fmt.Print(evt.Delta)
-			case "tool_use":
-				fmt.Fprintf(os.Stderr, "\n[tool: %s]\n", evt.ToolName)
-			case "tool_result":
-				if evt.ToolResult != nil && evt.ToolResult.IsError {
-					fmt.Fprintf(os.Stderr, "[tool error: %s]\n", evt.ToolResult.Content)
-				}
-			case "warning":
-				fmt.Fprintf(os.Stderr, "\n[warning: %s]\n", evt.Delta)
-			case "error":
-				fmt.Fprintf(os.Stderr, "\nError: %v\n", evt.Error)
-			case "turn_complete":
-				fmt.Println()
+		var msgs []message.Message
+		if len(history) > 0 {
+			msgs = append(msgs, history...)
+			msgs = append(msgs, message.NewUserMessage(input))
+			for evt := range agent.RunWithMessages(ctx, agentCfg, msgs) {
+				history = handleReplEvent(evt, history)
+			}
+		} else {
+			for evt := range agent.Run(ctx, agentCfg, input) {
+				history = handleReplEvent(evt, history)
 			}
 		}
 
 		cancel()
 		fmt.Println()
 	}
+}
+
+// handleReplEvent prints agent events and accumulates assistant messages into history.
+func handleReplEvent(evt agent.Event, history []message.Message) []message.Message {
+	switch evt.Type {
+	case "text_delta":
+		fmt.Print(evt.Delta)
+	case "tool_use":
+		fmt.Fprintf(os.Stderr, "\n[tool: %s]\n", evt.ToolName)
+	case "tool_result":
+		if evt.ToolResult != nil && evt.ToolResult.IsError {
+			fmt.Fprintf(os.Stderr, "[tool error: %s]\n", evt.ToolResult.Content)
+		}
+	case "warning":
+		fmt.Fprintf(os.Stderr, "\n[warning: %s]\n", evt.Delta)
+	case "error":
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", evt.Error)
+	case "turn_complete":
+		fmt.Println()
+	case "message_complete":
+		if evt.Message != nil {
+			history = append(history, *evt.Message)
+		}
+	}
+	return history
 }
 
 // runServer starts the Gin HTTP server.
@@ -465,7 +619,8 @@ func runServer(cfg *config.Config, pool *pgxpool.Pool) {
 }
 
 // runAgentLoop runs a multi-turn agent loop in the REPL with existing messages.
-func runAgentLoop(scanner *bufio.Scanner, agentCfg agent.Config, history []message.Message) {
+// Returns the final message history.
+func runAgentLoop(scanner *bufio.Scanner, agentCfg agent.Config, history []message.Message) []message.Message {
 	for {
 		fmt.Print("> ")
 		if !scanner.Scan() {
@@ -483,28 +638,12 @@ func runAgentLoop(scanner *bufio.Scanner, agentCfg agent.Config, history []messa
 			continue
 		}
 
-		// Append new user message to history
 		history = append(history, message.NewUserMessage(input))
 
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 
 		for evt := range agent.RunWithMessages(ctx, agentCfg, history) {
-			switch evt.Type {
-			case "text_delta":
-				fmt.Print(evt.Delta)
-			case "tool_use":
-				fmt.Fprintf(os.Stderr, "\n[tool: %s]\n", evt.ToolName)
-			case "tool_result":
-				if evt.ToolResult != nil && evt.ToolResult.IsError {
-					fmt.Fprintf(os.Stderr, "[tool error: %s]\n", evt.ToolResult.Content)
-				}
-			case "warning":
-				fmt.Fprintf(os.Stderr, "\n[warning: %s]\n", evt.Delta)
-			case "error":
-				fmt.Fprintf(os.Stderr, "\nError: %v\n", evt.Error)
-			case "turn_complete":
-				fmt.Println()
-			}
+			history = handleReplEvent(evt, history)
 		}
 
 		cancel()
@@ -518,4 +657,5 @@ func runAgentLoop(scanner *bufio.Scanner, agentCfg agent.Config, history []messa
 			}
 		}
 	}
+	return history
 }

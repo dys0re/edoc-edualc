@@ -34,6 +34,17 @@ func NewBashTool(workDir string, shell ShellType) *BashTool {
 	return &BashTool{workDir: workDir, shell: shell}
 }
 
+// SetWorkDir dynamically changes the working directory.
+// Used by agent loop when entering/exiting a worktree.
+func (t *BashTool) SetWorkDir(dir string) {
+	t.workDir = dir
+}
+
+// GetWorkDir returns the current working directory.
+func (t *BashTool) GetWorkDir() string {
+	return t.workDir
+}
+
 func (t *BashTool) Name() string { return "Bash" }
 
 func (t *BashTool) Description() string {

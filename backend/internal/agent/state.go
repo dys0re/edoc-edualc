@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"github.com/dysorder/edoc-edualc/backend/internal/hook"
 	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
@@ -50,13 +51,25 @@ type Config struct {
 	// PermissionCallback is called when user confirmation is needed.
 	// nil = all tools auto-approved (bypass mode behavior).
 	PermissionCallback tool.PermissionCallback
+
+	// PlansDir is the directory where plan files are stored.
+	// Empty = ~/.edoc/plans/
+	PlansDir string
+
+	// HookRunner executes hooks (PreToolUse, PostToolUse, etc.) from .edoc/settings.json.
+	// nil = hooks disabled. 对标 Claude Code 的 hooks 系统。
+	HookRunner *hook.Runner
 }
 
 // State is the mutable state carried between loop iterations.
 // Maps to query.ts:204 State type.
 type State struct {
-	Messages []message.Message
+	Messages  []message.Message
 	TurnCount int
+
+	// PlanMode: true when the agent is in plan-only exploration mode.
+	// Set by EnterPlanModeTool, cleared by ExitPlanModeTool.
+	PlanMode bool
 
 	// Recovery tracking
 	MaxOutputTokensRecoveryCount int  // 截断续写恢复次数，上限 3

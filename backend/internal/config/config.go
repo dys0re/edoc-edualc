@@ -55,6 +55,7 @@ type ToolsConfig struct {
 	MemoryDir      string   `mapstructure:"memory_dir"`      // 记忆目录，空=自动推导 ~/.edoc/projects/<path>/memory/
 	PermissionMode string   `mapstructure:"permission_mode"` // bypass / default / accept-edits / strict
 	AllowRules     []string `mapstructure:"allow_rules"`     // e.g. ["Read", "Bash:git *"]
+	PlansDir       string   `mapstructure:"plans_dir"`       // 计划文件目录，空=~/.edoc/plans/
 }
 
 type DatabaseConfig struct {

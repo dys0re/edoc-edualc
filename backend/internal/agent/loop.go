@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -183,6 +185,19 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 
 		// ── 9. 无 tool 调用 → 对话结束 ──
 		if len(toolUseBlocks) == 0 {
+			// Stop hooks: 在 agent 即将结束响应时触发
+			// 对标 hooks.ts executeStopHooks — exit code 2 注入 blocking error 继续对话
+			if cfg.HookRunner != nil {
+				stopResult, _ := cfg.HookRunner.RunStop(ctx)
+				if stopResult != nil && len(stopResult.BlockingErrors) > 0 {
+					errMsg := strings.Join(stopResult.BlockingErrors, "\n")
+					state.Messages = append(state.Messages,
+						message.NewUserMessage("Stop hook blocking error: "+errMsg))
+					ch <- Event{Type: "warning", Delta: "[stop hook: " + errMsg + "]"}
+					persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
+					continue // 继续循环，让 LLM 处理 blocking error
+				}
+			}
 			persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
 			ch <- Event{Type: "turn_complete"}
 			return
@@ -230,7 +245,87 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 			}
 		}
 
-		// ── 10. 执行 tools ──
+		// ── 10. Plan mode: 拦截写操作工具 ──
+		// 在 plan mode 下，只允许 EnterPlanMode / ExitPlanMode / 只读工具。
+		if state.PlanMode {
+			var allowed []*message.ToolUseBlock
+			for _, tu := range toolUseBlocks {
+				if tu.Name == "ExitPlanMode" || tu.Name == "EnterPlanMode" {
+					allowed = append(allowed, tu)
+					continue
+				}
+				t, tErr := cfg.Registry.Get(tu.Name)
+				if tErr != nil || !t.IsReadOnly(tu.Input) {
+					errMsg := fmt.Sprintf("Tool %q is not allowed in plan mode. Only read-only tools and ExitPlanMode are permitted.", tu.Name)
+					state.Messages = append(state.Messages,
+						message.NewToolResultMessage(tu.ID, errMsg, true))
+					ch <- Event{Type: "tool_result", ToolName: tu.Name,
+						ToolResult: &tool.Result{Content: errMsg, IsError: true}}
+				} else {
+					allowed = append(allowed, tu)
+				}
+			}
+			toolUseBlocks = allowed
+			if len(toolUseBlocks) == 0 {
+				persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
+				continue
+			}
+		}
+
+		// ── 11. PreToolUse hooks ──
+		// 对标 toolHooks.ts:runPreToolUseHooks — 在 tool 执行前触发，可 block/修改 input
+		if cfg.HookRunner != nil {
+			var hookApproved []*message.ToolUseBlock
+			for _, tu := range toolUseBlocks {
+				hookResult, hookErr := cfg.HookRunner.RunPreToolUse(ctx, tu.Name, tu.ID, tu.Input)
+				if hookErr != nil {
+					ch <- Event{Type: "warning", Delta: fmt.Sprintf("[PreToolUse hook error: %v]", hookErr)}
+					hookApproved = append(hookApproved, tu)
+					continue
+				}
+				if hookResult == nil {
+					hookApproved = append(hookApproved, tu)
+					continue
+				}
+
+				// Block decision → deny tool execution
+				if hookResult.Decision == "block" {
+					errMsg := "Blocked by PreToolUse hook"
+					if len(hookResult.BlockingErrors) > 0 {
+						errMsg = strings.Join(hookResult.BlockingErrors, "; ")
+					}
+					state.Messages = append(state.Messages,
+						message.NewToolResultMessage(tu.ID, errMsg, true))
+					ch <- Event{Type: "tool_result", ToolName: tu.Name,
+						ToolResult: &tool.Result{Content: errMsg, IsError: true}}
+					continue
+				}
+
+				// UpdatedInput → replace tool input
+				if hookResult.UpdatedInput != nil {
+					updated, marshalErr := json.Marshal(hookResult.UpdatedInput)
+					if marshalErr == nil {
+						tu.Input = updated
+					}
+				}
+
+				// AdditionalContext → inject as system-reminder
+				if len(hookResult.AdditionalContext) > 0 {
+					ctx := strings.Join(hookResult.AdditionalContext, "\n")
+					state.Messages = append(state.Messages,
+						message.NewUserMessage("<system-reminder>PreToolUse hook: "+ctx+"</system-reminder>"))
+				}
+
+				hookApproved = append(hookApproved, tu)
+			}
+			toolUseBlocks = hookApproved
+			if len(toolUseBlocks) == 0 {
+				persistNewMessages(ctx, cfg, state, prevMsgCount, ch)
+				continue
+			}
+		}
+
+		// ── 12. 执行 tools ──
 		results := executeTools(ctx, cfg.Registry, toolUseBlocks)
 
 		for _, r := range results {
@@ -240,6 +335,66 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 			// Skill inline 执行：把 skill 内容注入为 user message，LLM 下一轮跟随执行
 			if r.result.Metadata["type"] == "skill_inline" && r.result.Content != "" {
 				state.Messages = append(state.Messages, message.NewUserMessage(r.result.Content))
+			}
+
+			// Plan mode 状态切换
+			switch r.result.Metadata["type"] {
+			case "enter_plan_mode":
+				state.PlanMode = true
+				ch <- Event{Type: "warning", Delta: "[plan mode: on]"}
+			case "exit_plan_mode":
+				state.PlanMode = false
+				ch <- Event{Type: "warning", Delta: "[plan mode: off]"}
+			case "enter_worktree":
+				// 切换 BashTool 工作目录到 worktree
+				if wtPath := r.result.Metadata["worktree_path"]; wtPath != "" {
+					if bashTool, err := cfg.Registry.Get("Bash"); err == nil {
+						if bt, ok := bashTool.(*tool.BashTool); ok {
+							bt.SetWorkDir(wtPath)
+						}
+					}
+					// 同步更新 EnterWorktreeTool 的 WorkDir
+					if wtTool, err := cfg.Registry.Get("EnterWorktree"); err == nil {
+						if ewt, ok := wtTool.(*tool.EnterWorktreeTool); ok {
+							ewt.WorkDir = wtPath
+						}
+					}
+					ch <- Event{Type: "warning", Delta: "[worktree: entered " + wtPath + "]"}
+				}
+			case "exit_worktree":
+				// 恢复 BashTool 工作目录到原始 CWD
+				if origCwd := r.result.Metadata["original_cwd"]; origCwd != "" {
+					if bashTool, err := cfg.Registry.Get("Bash"); err == nil {
+						if bt, ok := bashTool.(*tool.BashTool); ok {
+							bt.SetWorkDir(origCwd)
+						}
+					}
+					if wtTool, err := cfg.Registry.Get("EnterWorktree"); err == nil {
+						if ewt, ok := wtTool.(*tool.EnterWorktreeTool); ok {
+							ewt.WorkDir = origCwd
+						}
+					}
+					ch <- Event{Type: "warning", Delta: "[worktree: exited, back to " + origCwd + "]"}
+				}
+			}
+
+			// ── 13. PostToolUse hooks ──
+			// 对标 toolHooks.ts:runPostToolUseHooks — 在 tool 执行后触发
+			if cfg.HookRunner != nil && !r.result.IsError {
+				postResult, _ := cfg.HookRunner.RunPostToolUse(ctx, r.toolName, "", nil, &r.result)
+				if postResult != nil {
+					if len(postResult.AdditionalContext) > 0 {
+						ctxMsg := strings.Join(postResult.AdditionalContext, "\n")
+						state.Messages = append(state.Messages,
+							message.NewUserMessage("<system-reminder>PostToolUse hook: "+ctxMsg+"</system-reminder>"))
+					}
+					if len(postResult.BlockingErrors) > 0 {
+						errMsg := strings.Join(postResult.BlockingErrors, "; ")
+						state.Messages = append(state.Messages,
+							message.NewUserMessage("PostToolUse hook blocking error: "+errMsg))
+						ch <- Event{Type: "warning", Delta: "[PostToolUse hook: " + errMsg + "]"}
+					}
+				}
 			}
 		}
 
