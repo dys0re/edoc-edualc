@@ -8,6 +8,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/dysorder/edoc-edualc/backend/internal/skill"
+	"github.com/dysorder/edoc-edualc/backend/internal/task"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 )
 
@@ -64,6 +65,15 @@ type Config struct {
 	// LSPManager manages LSP server connections for code intelligence.
 	// nil = LSP disabled. 对标 Claude Code 的 services/lsp/。
 	LSPManager *lsp.Manager
+
+	// TaskNotifier 提供后台任务完成通知。由 task.Manager 实现。
+	// nil = 后台任务不可用。对标 Claude Code 的 notification 注入机制。
+	TaskNotifier TaskNotifier
+}
+
+// TaskNotifier 提供后台任务通知 channel。由 task.Manager 实现。
+type TaskNotifier interface {
+	Notifications() <-chan task.TaskNotification
 }
 
 // State is the mutable state carried between loop iterations.

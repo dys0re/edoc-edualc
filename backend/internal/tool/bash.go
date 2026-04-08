@@ -28,10 +28,16 @@ const (
 type BashTool struct {
 	workDir string
 	shell   ShellType
+	taskMgr TaskStarter // 后台任务管理器。nil = 后台执行不可用。
 }
 
 func NewBashTool(workDir string, shell ShellType) *BashTool {
 	return &BashTool{workDir: workDir, shell: shell}
+}
+
+// SetTaskManager 设置后台任务管理器。由 main.go 接线时调用。
+func (t *BashTool) SetTaskManager(mgr TaskStarter) {
+	t.taskMgr = mgr
 }
 
 // SetWorkDir dynamically changes the working directory.
@@ -63,14 +69,19 @@ func (t *BashTool) InputSchema() map[string]interface{} {
 				"type":        "integer",
 				"description": "Timeout in milliseconds (max 600000)",
 			},
+			"run_in_background": map[string]interface{}{
+				"type":        "boolean",
+				"description": "If true, run the command in the background and return immediately. Use TaskOutput to read results.",
+			},
 		},
 		"required": []string{"command"},
 	}
 }
 
 type bashInput struct {
-	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"`
+	Command         string `json:"command"`
+	Timeout         int    `json:"timeout,omitempty"`
+	RunInBackground bool   `json:"run_in_background,omitempty"`
 }
 
 func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result, error) {
@@ -83,6 +94,21 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 		return &Result{Content: "Empty command", IsError: true}, nil
 	}
 
+	// ── 后台执行模式 ──
+	// 对标 Claude Code 的 BashTool run_in_background 参数。
+	if in.RunInBackground && t.taskMgr != nil {
+		taskID, err := t.taskMgr.StartShellTaskFromTool(ctx, in.Command, in.Command, t.workDir)
+		if err != nil {
+			return &Result{Content: fmt.Sprintf("Failed to start background task: %v", err), IsError: true}, nil
+		}
+		return &Result{
+			Content: fmt.Sprintf("Background task started: %s\nUse TaskOutput with task_id %q to read output.", taskID, taskID),
+			Metadata: map[string]string{
+				"background_task_id": taskID,
+			},
+		}, nil
+	}
+
 	timeout := 120 * time.Second
 	if in.Timeout > 0 {
 		timeout = time.Duration(min(in.Timeout, 600000)) * time.Millisecond
@@ -93,10 +119,10 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 
 	shell := t.shell
 	if shell == ShellAuto {
-		shell = detectShell()
+		shell = DetectShell()
 	}
 
-	cmd := buildCommand(ctx, shell, in.Command)
+	cmd := BuildCommand(ctx, shell, in.Command)
 	cmd.Dir = t.workDir
 
 	var stdout, stderr bytes.Buffer
@@ -105,8 +131,8 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 
 	err := cmd.Run()
 
-	outStr := decodeOutput(stdout.Bytes())
-	errStr := decodeOutput(stderr.Bytes())
+	outStr := DecodeOutput(stdout.Bytes())
+	errStr := DecodeOutput(stderr.Bytes())
 
 	var output string
 	if outStr != "" && errStr != "" {
@@ -143,8 +169,9 @@ func (t *BashTool) PermissionDescription(input json.RawMessage) string {
 }
 func (t *BashTool) IsFileEdit(_ json.RawMessage) bool { return false }
 
-// buildCommand creates the exec.Cmd for the given shell type.
-func buildCommand(ctx context.Context, shell ShellType, command string) *exec.Cmd {
+// BuildCommand creates the exec.Cmd for the given shell type.
+// Exported for use by the task package (background shell execution).
+func BuildCommand(ctx context.Context, shell ShellType, command string) *exec.Cmd {
 	switch shell {
 	case ShellPowerShell:
 		// pwsh (PowerShell 7+) preferred, fall back to Windows PowerShell
@@ -162,10 +189,10 @@ func buildCommand(ctx context.Context, shell ShellType, command string) *exec.Cm
 	}
 }
 
-// detectShell picks the best available shell on the current OS.
+// DetectShell picks the best available shell on the current OS.
 // Windows: pwsh > powershell > bash > cmd
 // Unix: bash
-func detectShell() ShellType {
+func DetectShell() ShellType {
 	if runtime.GOOS != "windows" {
 		return ShellBash
 	}
@@ -181,10 +208,11 @@ func detectShell() ShellType {
 	return ShellCmd
 }
 
-// decodeOutput decodes command output bytes to a UTF-8 string.
+// DecodeOutput decodes command output bytes to a UTF-8 string.
 // On Windows, command output is often GBK (CP936) on Chinese systems.
 // Strategy: if bytes are valid UTF-8, use as-is; otherwise try GBK → UTF-8.
-func decodeOutput(data []byte) string {
+// Exported for use by the task package (background shell output).
+func DecodeOutput(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}

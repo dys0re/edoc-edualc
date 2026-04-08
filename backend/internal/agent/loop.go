@@ -13,6 +13,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
+	"github.com/dysorder/edoc-edualc/backend/internal/task"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/dysorder/edoc-edualc/backend/internal/token"
 )
@@ -65,6 +66,19 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		if ctx.Err() != nil {
 			ch <- Event{Type: "error", Error: ctx.Err()}
 			return
+		}
+
+		// ── 1.5 后台任务通知检查 ──
+		// 对标 Claude Code 的 notification 注入机制：
+		// 后台任务完成时注入 user message 通知 LLM
+		if cfg.TaskNotifier != nil {
+			select {
+			case notif := <-cfg.TaskNotifier.Notifications():
+				msg := formatTaskNotification(notif)
+				state.Messages = append(state.Messages, message.NewUserMessage(msg))
+				ch <- Event{Type: "warning", Delta: "[background task: " + notif.Message + "]"}
+			default:
+			}
 		}
 
 		// ── 2. MaxTurns 检查 ──
@@ -666,4 +680,11 @@ func runSingle(ctx context.Context, reg *tool.Registry, block *message.ToolUseBl
 		msg:      message.NewToolResultMessage(block.ID, result.Content, result.IsError),
 		result:   *result,
 	}
+}
+
+// formatTaskNotification 格式化后台任务通知为 user message。
+// 对标 Claude Code 的 <task-notification> XML 注入。
+func formatTaskNotification(notif task.TaskNotification) string {
+	return fmt.Sprintf("<system-reminder>\nBackground task completed:\n- Task ID: %s\n- Type: %s\n- Status: %s\n- %s\nUse TaskOutput with task_id %q to read the output.\n</system-reminder>",
+		notif.TaskID, notif.TaskType, notif.Status, notif.Message, notif.TaskID)
 }

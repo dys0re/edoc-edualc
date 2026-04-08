@@ -24,6 +24,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/dysorder/edoc-edualc/backend/internal/skill"
+	"github.com/dysorder/edoc-edualc/backend/internal/task"
 	"github.com/dysorder/edoc-edualc/backend/internal/token"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -171,7 +172,7 @@ func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store, 
 }
 
 // buildAgentConfig 组装 agent.Config (with Agent tool wired in).
-func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback) agent.Config {
+func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback) (agent.Config, *task.Manager) {
 	workDir := cfg.Tools.WorkDir
 	if workDir == "." {
 		workDir, _ = os.Getwd()
@@ -181,7 +182,14 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	p := buildProvider(cfg)
 	webFetchProvider := tool.NewProviderWebFetch(p, cfg.Provider.ModelBackup)
 	reg := tool.NewRegistry()
-	reg.Register(tool.NewBashTool(workDir, shell))
+
+	// 后台任务管理器。对标 Claude Code 的 AppState.tasks。
+	// 注意: Close() 由调用方在 agent loop 结束后调用。
+	taskMgr := task.NewManager()
+
+	bashTool := tool.NewBashTool(workDir, shell)
+	bashTool.SetTaskManager(taskMgr)
+	reg.Register(bashTool)
 	reg.Register(tool.NewReadTool())
 	reg.Register(tool.NewWriteTool())
 	reg.Register(tool.NewGlobTool())
@@ -211,6 +219,10 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	// Worktree tools
 	reg.Register(&tool.EnterWorktreeTool{WorkDir: workDir})
 	reg.Register(&tool.ExitWorktreeTool{})
+
+	// Task tools — 后台任务输出读取和停止
+	reg.Register(&tool.TaskOutputTool{Manager: taskMgr})
+	reg.Register(&tool.TaskStopTool{Manager: taskMgr})
 
 	// MCP: 连接所有配置的 server，注册发现的工具
 	if len(cfg.MCPServers) > 0 {
@@ -248,6 +260,7 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 		PermissionMode:       tool.ParsePermissionMode(cfg.Tools.PermissionMode),
 		AllowRules:           cfg.Tools.AllowRules,
 		PermissionCallback:   permCallback,
+		TaskNotifier:         taskMgr,
 	}
 
 	// Hooks: 从 .edoc/settings.json 加载
@@ -285,7 +298,7 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	resolver := agent.NewSubagentResolver(agentCfg)
 	reg.Register(&tool.AgentTool{Resolver: resolver})
 
-	return agentCfg
+	return agentCfg, taskMgr
 }
 
 // buildPermissionCallback creates a REPL permission callback that reads y/n from stdin.
@@ -365,7 +378,8 @@ func buildPromptEvaluator(p provider.Provider, defaultModel string) hook.PromptE
 // runOnce executes a single prompt and exits. Maps to `claude -p "..."`.
 func runOnce(cfg *config.Config, pool *pgxpool.Pool, userPrompt string) {
 	scanner := bufio.NewScanner(os.Stdin)
-	agentCfg := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner))
+	agentCfg, taskMgr := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner))
+	defer taskMgr.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -599,13 +613,15 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 			history = loaded
 			fmt.Printf("Loaded %d messages from history.\n", len(history))
 
-			agentCfg := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+			agentCfg, taskMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+			defer taskMgr.Close()
 			history = runAgentLoop(scanner, agentCfg, history)
 			continue
 		}
 
 		// ── Normal prompt ──
-		agentCfg := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+		agentCfg, taskMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+			defer taskMgr.Close()
 
 		// UserPromptSubmit hooks: 在用户提交 prompt 后、agent 执行前触发
 		if agentCfg.HookRunner != nil {
