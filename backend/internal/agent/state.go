@@ -2,6 +2,7 @@ package agent
 
 import (
 	"github.com/dysorder/edoc-edualc/backend/internal/hook"
+	"github.com/dysorder/edoc-edualc/backend/internal/lsp"
 	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
@@ -59,6 +60,10 @@ type Config struct {
 	// HookRunner executes hooks (PreToolUse, PostToolUse, etc.) from .edoc/settings.json.
 	// nil = hooks disabled. 对标 Claude Code 的 hooks 系统。
 	HookRunner *hook.Runner
+
+	// LSPManager manages LSP server connections for code intelligence.
+	// nil = LSP disabled. 对标 Claude Code 的 services/lsp/。
+	LSPManager *lsp.Manager
 }
 
 // State is the mutable state carried between loop iterations.

@@ -16,6 +16,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/config"
 	"github.com/dysorder/edoc-edualc/backend/internal/db"
 	"github.com/dysorder/edoc-edualc/backend/internal/hook"
+	"github.com/dysorder/edoc-edualc/backend/internal/lsp"
 	"github.com/dysorder/edoc-edualc/backend/internal/mcp"
 	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
@@ -263,6 +264,21 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 		// Wire PromptEvaluator for type=prompt hooks
 		runner.PromptEval = buildPromptEvaluator(p, cfg.Provider.Model)
 		agentCfg.HookRunner = runner
+	}
+
+	// LSP: 从 .edoc/settings.json 加载 lsp_servers 配置
+	lspConfigs, lspErr := lsp.LoadLSPSettings(workDir)
+	if lspErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: LSP config: %v\n", lspErr)
+	}
+	if len(lspConfigs) > 0 {
+		lspManager := lsp.NewManager(workDir)
+		if err := lspManager.Initialize(lspConfigs); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: LSP init: %v\n", err)
+		} else {
+			reg.Register(&tool.LSPTool{Manager: lspManager})
+			agentCfg.LSPManager = lspManager
+		}
 	}
 
 	// Wire Agent tool with subagent resolver (references the config being built)

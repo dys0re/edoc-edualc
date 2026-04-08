@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -413,6 +414,28 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 							state.Messages = append(state.Messages,
 								message.NewUserMessage("PostToolUse hook blocking error: "+errMsg))
 							ch <- Event{Type: "warning", Delta: "[PostToolUse hook: " + errMsg + "]"}
+						}
+					}
+				}
+			}
+
+			// ── 14. LSP file sync — Edit/Write 后通知 LSP server ──
+			if cfg.LSPManager != nil && !r.result.IsError {
+				if r.toolName == "Write" || r.toolName == "Edit" {
+					var fileInput struct {
+						FilePath string `json:"file_path"`
+					}
+					// 找到对应的 toolUseBlock 获取 input
+					for _, b := range toolUseBlocks {
+						if b.Name == r.toolName {
+							json.Unmarshal(b.Input, &fileInput)
+							break
+						}
+					}
+					if fileInput.FilePath != "" {
+						if content, readErr := os.ReadFile(fileInput.FilePath); readErr == nil {
+							cfg.LSPManager.ChangeFile(fileInput.FilePath, string(content))
+							cfg.LSPManager.SaveFile(fileInput.FilePath)
 						}
 					}
 				}
