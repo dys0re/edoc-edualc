@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -254,11 +255,14 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 		fmt.Fprintf(os.Stderr, "Warning: hooks config: %v\n", hookErr)
 	}
 	if len(hooksCfg) > 0 {
-		agentCfg.HookRunner = &hook.Runner{
+		runner := &hook.Runner{
 			Config:  hooksCfg,
 			WorkDir: workDir,
 			Shell:   cfg.Tools.Shell,
 		}
+		// Wire PromptEvaluator for type=prompt hooks
+		runner.PromptEval = buildPromptEvaluator(p, cfg.Provider.Model)
+		agentCfg.HookRunner = runner
 	}
 
 	// Wire Agent tool with subagent resolver (references the config being built)
@@ -289,6 +293,56 @@ func buildAskCallback(scanner *bufio.Scanner) func(string) (string, error) {
 			return "", nil
 		}
 		return strings.TrimSpace(scanner.Text()), nil
+	}
+}
+
+// buildPromptEvaluator creates a PromptEvaluator for prompt-type hooks.
+// Calls the LLM with a simple system prompt asking for {"ok": true/false, "reason": "..."}.
+// 对标 execPromptHook.ts
+func buildPromptEvaluator(p provider.Provider, defaultModel string) hook.PromptEvaluator {
+	return func(ctx context.Context, promptText string, model string) (bool, string, error) {
+		if model == "" {
+			model = defaultModel
+		}
+		sysPrompt := `You are evaluating a hook condition. Your response must be a JSON object:
+1. If the condition is met: {"ok": true}
+2. If not met: {"ok": false, "reason": "why"}`
+
+		msgs := []message.Message{message.NewUserMessage(promptText)}
+		req := provider.ChatRequest{
+			Messages:     msgs,
+			SystemPrompt: sysPrompt,
+			Model:        model,
+			MaxTokens:    1024,
+		}
+		streamCh, err := p.StreamChat(ctx, req)
+		if err != nil {
+			return false, "", err
+		}
+		// Consume stream to get full response
+		var text string
+		for evt := range streamCh {
+			if evt.Type == "text_delta" {
+				text += evt.Delta
+			}
+			if evt.Type == "message_complete" && evt.Message != nil {
+				for _, block := range evt.Message.Content {
+					if block.Text != nil {
+						text = block.Text.Text
+					}
+				}
+			}
+		}
+		// Parse JSON response
+		text = strings.TrimSpace(text)
+		var result struct {
+			OK     bool   `json:"ok"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(text), &result); err != nil {
+			return false, fmt.Sprintf("failed to parse LLM response: %s", text), nil
+		}
+		return result.OK, result.Reason, nil
 	}
 }
 

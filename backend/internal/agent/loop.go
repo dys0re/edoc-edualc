@@ -88,6 +88,10 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		if cfg.AutoCompactThreshold > 0 {
 			tokenCount := token.EstimateMessages(state.Messages)
 			if tokenCount > cfg.AutoCompactThreshold {
+				// PreCompact hook
+				if cfg.HookRunner != nil {
+					cfg.HookRunner.RunPreCompact(ctx)
+				}
 				compactCfg := compact.CompactConfig{
 					Provider:  cfg.Provider,
 					Model:     currentModel,
@@ -108,6 +112,10 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 							)},
 						}},
 					}}
+					// PostCompact hook
+					if cfg.HookRunner != nil {
+						cfg.HookRunner.RunPostCompact(ctx)
+					}
 				}
 			}
 		}
@@ -222,6 +230,10 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 						message.NewToolResultMessage(tu.ID, "Permission denied", true))
 					ch <- Event{Type: "tool_result", ToolName: tu.Name,
 						ToolResult: &tool.Result{Content: "Permission denied", IsError: true}}
+					// PermissionDenied hook
+					if cfg.HookRunner != nil {
+						cfg.HookRunner.RunPermissionDenied(ctx, tu.Name, tu.ID, tu.Input, "rule-based deny")
+					}
 				case tool.DecisionAsk:
 					desc := t.PermissionDescription(tu.Input)
 					ch <- Event{Type: "permission_request",
@@ -232,6 +244,10 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 							message.NewToolResultMessage(tu.ID, "Permission denied by user", true))
 						ch <- Event{Type: "tool_result", ToolName: tu.Name,
 							ToolResult: &tool.Result{Content: "Permission denied by user", IsError: true}}
+						// PermissionDenied hook
+						if cfg.HookRunner != nil {
+							cfg.HookRunner.RunPermissionDenied(ctx, tu.Name, tu.ID, tu.Input, "user denied")
+						}
 					} else {
 						approved = append(approved, tu)
 					}
@@ -378,21 +394,26 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 				}
 			}
 
-			// ── 13. PostToolUse hooks ──
-			// 对标 toolHooks.ts:runPostToolUseHooks — 在 tool 执行后触发
-			if cfg.HookRunner != nil && !r.result.IsError {
-				postResult, _ := cfg.HookRunner.RunPostToolUse(ctx, r.toolName, "", nil, &r.result)
-				if postResult != nil {
-					if len(postResult.AdditionalContext) > 0 {
-						ctxMsg := strings.Join(postResult.AdditionalContext, "\n")
-						state.Messages = append(state.Messages,
-							message.NewUserMessage("<system-reminder>PostToolUse hook: "+ctxMsg+"</system-reminder>"))
-					}
-					if len(postResult.BlockingErrors) > 0 {
-						errMsg := strings.Join(postResult.BlockingErrors, "; ")
-						state.Messages = append(state.Messages,
-							message.NewUserMessage("PostToolUse hook blocking error: "+errMsg))
-						ch <- Event{Type: "warning", Delta: "[PostToolUse hook: " + errMsg + "]"}
+			// ── 13. PostToolUse / PostToolUseFailure hooks ──
+			if cfg.HookRunner != nil {
+				if r.result.IsError {
+					// PostToolUseFailure hook — tool 执行失败时触发
+					cfg.HookRunner.RunPostToolUseFailure(ctx, r.toolName, "", nil, r.result.Content, false)
+				} else {
+					// PostToolUse hook — tool 执行成功后触发
+					postResult, _ := cfg.HookRunner.RunPostToolUse(ctx, r.toolName, "", nil, &r.result)
+					if postResult != nil {
+						if len(postResult.AdditionalContext) > 0 {
+							ctxMsg := strings.Join(postResult.AdditionalContext, "\n")
+							state.Messages = append(state.Messages,
+								message.NewUserMessage("<system-reminder>PostToolUse hook: "+ctxMsg+"</system-reminder>"))
+						}
+						if len(postResult.BlockingErrors) > 0 {
+							errMsg := strings.Join(postResult.BlockingErrors, "; ")
+							state.Messages = append(state.Messages,
+								message.NewUserMessage("PostToolUse hook blocking error: "+errMsg))
+							ch <- Event{Type: "warning", Delta: "[PostToolUse hook: " + errMsg + "]"}
+						}
 					}
 				}
 			}

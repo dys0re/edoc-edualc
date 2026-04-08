@@ -1,33 +1,53 @@
 // Package hook implements the hooks system for edoc-edualc.
 // 对标 Claude Code 的 hooks 系统（src/utils/hooks.ts），支持在工具执行前后
-// 自动运行 shell 命令，实现自动化审查、日志记录、权限控制等功能。
+// 自动运行 shell 命令/HTTP 请求/LLM 评估，实现自动化审查、日志记录、权限控制等功能。
 //
-// Phase 1 支持:
-//   - 事件: PreToolUse, PostToolUse, UserPromptSubmit, Stop
-//   - Hook 类型: command（shell 命令执行）
+// 支持:
+//   - 事件: PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop,
+//     Notification, SessionStart, SessionEnd, SubagentStart, SubagentStop,
+//     PreCompact, PostCompact, PermissionDenied
+//   - Hook 类型: command（shell 命令）, http（HTTP POST）, prompt（LLM 评估）
 //   - matcher 匹配、if 条件过滤、JSON stdin/stdout 协议、exit code 语义
+//   - once 标志（执行一次后移除）、asyncRewake（后台执行完成后唤醒模型）
+//   - per-hook shell 覆盖
 package hook
 
 import "encoding/json"
 
-// HookEvent 枚举，对标 src/entrypoints/agentSdkTypes.ts:HOOK_EVENTS
+// HookEvent 枚举，对标 src/entrypoints/sdk/coreTypes.ts:HOOK_EVENTS
 type HookEvent string
 
 const (
-	PreToolUse       HookEvent = "PreToolUse"
-	PostToolUse      HookEvent = "PostToolUse"
-	UserPromptSubmit HookEvent = "UserPromptSubmit"
-	Stop             HookEvent = "Stop"
+	PreToolUse         HookEvent = "PreToolUse"
+	PostToolUse        HookEvent = "PostToolUse"
+	PostToolUseFailure HookEvent = "PostToolUseFailure"
+	UserPromptSubmit   HookEvent = "UserPromptSubmit"
+	Stop               HookEvent = "Stop"
+	Notification       HookEvent = "Notification"
+	SessionStart       HookEvent = "SessionStart"
+	SessionEnd         HookEvent = "SessionEnd"
+	SubagentStart      HookEvent = "SubagentStart"
+	SubagentStop       HookEvent = "SubagentStop"
+	PreCompact         HookEvent = "PreCompact"
+	PostCompact        HookEvent = "PostCompact"
+	PermissionDenied   HookEvent = "PermissionDenied"
 )
 
-// HookConfig 单个 hook 定义，对标 BashCommandHookSchema
+// HookConfig 单个 hook 定义，对标 HookCommandSchema (discriminated union)
 type HookConfig struct {
-	Type          string `json:"type"`                      // "command"
-	Command       string `json:"command"`                   // shell 命令
-	If            string `json:"if,omitempty"`              // permission rule 语法过滤，如 "Bash(git *)"
-	Timeout       int    `json:"timeout,omitempty"`         // 超时秒数
-	Async         bool   `json:"async,omitempty"`           // 后台执行
-	StatusMessage string `json:"statusMessage,omitempty"`   // 自定义状态消息
+	Type          string            `json:"type"`                      // "command" / "http" / "prompt"
+	Command       string            `json:"command,omitempty"`         // shell 命令 (type=command)
+	URL           string            `json:"url,omitempty"`             // HTTP URL (type=http)
+	Prompt        string            `json:"prompt,omitempty"`          // LLM prompt (type=prompt)
+	Headers       map[string]string `json:"headers,omitempty"`         // HTTP headers (type=http)
+	Model         string            `json:"model,omitempty"`           // LLM model (type=prompt)
+	If            string            `json:"if,omitempty"`              // permission rule 语法过滤
+	Shell         string            `json:"shell,omitempty"`           // per-hook shell 覆盖
+	Timeout       int               `json:"timeout,omitempty"`         // 超时秒数
+	Async         bool              `json:"async,omitempty"`           // 后台执行
+	AsyncRewake   bool              `json:"asyncRewake,omitempty"`     // 后台执行，exit code 2 唤醒模型
+	Once          bool              `json:"once,omitempty"`            // 执行一次后移除
+	StatusMessage string            `json:"statusMessage,omitempty"`   // 自定义状态消息
 }
 
 // HookMatcher matcher + hooks 数组，对标 HookMatcherSchema
@@ -50,10 +70,24 @@ type HookInput struct {
 	CWD           string      `json:"cwd,omitempty"`
 	// UserPromptSubmit
 	Prompt string `json:"prompt,omitempty"`
+	// PostToolUseFailure
+	Error       string `json:"error,omitempty"`
+	IsInterrupt *bool  `json:"is_interrupt,omitempty"`
+	// Notification
+	Message          string `json:"message,omitempty"`
+	Title            string `json:"title,omitempty"`
+	NotificationType string `json:"notification_type,omitempty"`
+	// PermissionDenied
+	DenyReason string `json:"reason,omitempty"`
+	// SubagentStart/SubagentStop
+	AgentType string `json:"agent_type,omitempty"`
 }
 
 // HookJSONOutput hook 命令的 JSON stdout 输出，对标 syncHookResponseSchema
 type HookJSONOutput struct {
+	// Async response: {"async": true} — hook runs in background
+	AsyncFlag         *bool  `json:"async,omitempty"`
+	// Sync response fields
 	Decision          string `json:"decision,omitempty"`      // "approve" / "block"
 	Reason            string `json:"reason,omitempty"`
 	Continue          *bool  `json:"continue,omitempty"`      // false = prevent continuation
@@ -61,6 +95,11 @@ type HookJSONOutput struct {
 	SuppressOutput    bool   `json:"suppressOutput,omitempty"`
 	SystemMessage     string `json:"systemMessage,omitempty"`
 	HookSpecificOutput *HookSpecificOutput `json:"hookSpecificOutput,omitempty"`
+}
+
+// IsAsync returns true if this is an async hook response.
+func (o *HookJSONOutput) IsAsync() bool {
+	return o.AsyncFlag != nil && *o.AsyncFlag
 }
 
 // HookSpecificOutput 事件特定的输出字段

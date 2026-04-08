@@ -65,7 +65,9 @@ func SettingsPath(workDir string) string {
 
 func isValidEvent(e HookEvent) bool {
 	switch e {
-	case PreToolUse, PostToolUse, UserPromptSubmit, Stop:
+	case PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop,
+		Notification, SessionStart, SessionEnd, SubagentStart, SubagentStop,
+		PreCompact, PostCompact, PermissionDenied:
 		return true
 	}
 	return false
