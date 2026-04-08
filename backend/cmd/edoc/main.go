@@ -17,6 +17,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
+	"github.com/dysorder/edoc-edualc/backend/internal/skill"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -134,15 +135,23 @@ func buildSessionStore(pool *pgxpool.Pool) *session.Store {
 	return session.NewStore(pool)
 }
 
-// buildSystemPrompt 构建 system prompt（注入记忆）
-func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store) string {
+// buildSkillRegistry 加载 skill 注册表
+func buildSkillRegistry(workDir string) *skill.Registry {
+	dirs := skill.DefaultDirs(workDir)
+	reg, err := skill.Load(dirs)
+	if err != nil || reg == nil {
+		return skill.NewRegistry()
+	}
+	return reg
+}
+
+// buildSystemPrompt 构建 system prompt（注入记忆 + skill 列表）
+func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store, skillReg *skill.Registry) string {
 	var memorySection string
 	if store != nil {
 		memorySection = memory.BuildMemoryPromptSectionPG(context.Background(), store)
 	}
-
 	if memorySection == "" {
-		// 回退到文件版
 		memoryDir := cfg.Tools.MemoryDir
 		if memoryDir == "" {
 			memoryDir = memory.GetMemoryDir(workDir)
@@ -150,7 +159,8 @@ func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store) 
 		memorySection = memory.BuildMemoryPromptSection(memoryDir)
 	}
 
-	return prompt.BuildSystemPromptWithMemory(workDir, memorySection)
+	skillSection := skill.BuildSystemReminderSection(skillReg.All())
+	return prompt.BuildSystemPromptWithSkills(workDir, memorySection, skillSection)
 }
 
 // buildAgentConfig 组装 agent.Config (with Agent tool wired in).
@@ -174,11 +184,14 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 
 	memStore := buildMemoryStore(pool, workDir)
 	sessStore := buildSessionStore(pool)
+	skillReg := buildSkillRegistry(workDir)
+
+	reg.Register(&tool.SkillTool{Registry: skillReg})
 
 	agentCfg := agent.Config{
-		Provider:     p,
-		Registry:     reg,
-		SystemPrompt: buildSystemPrompt(cfg, workDir, memStore),
+		Provider:             p,
+		Registry:             reg,
+		SystemPrompt:         buildSystemPrompt(cfg, workDir, memStore, skillReg),
 		Model:        cfg.Provider.Model,
 		MaxTokens:    cfg.Agent.MaxTokens,
 		MaxTurns:     cfg.Agent.MaxTurns,

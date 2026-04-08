@@ -236,6 +236,11 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		for _, r := range results {
 			state.Messages = append(state.Messages, r.msg)
 			ch <- Event{Type: "tool_result", ToolResult: &r.result, ToolName: r.toolName}
+
+			// Skill inline 执行：把 skill 内容注入为 user message，LLM 下一轮跟随执行
+			if r.result.Metadata["type"] == "skill_inline" && r.result.Content != "" {
+				state.Messages = append(state.Messages, message.NewUserMessage(r.result.Content))
+			}
 		}
 
 		// Tool 执行成功，重置恢复计数

@@ -5,6 +5,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
+	"github.com/dysorder/edoc-edualc/backend/internal/skill"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 )
 
@@ -28,6 +29,10 @@ type Config struct {
 
 	// MemoryStore is the PG-backed memory store. nil = memory disabled.
 	MemoryStore *memory.Store
+
+	// SkillRegistry holds loaded skills for the SkillTool.
+	// nil = skill system disabled.
+	SkillRegistry *skill.Registry
 
 	// SessionStore is the PG-backed session store. nil = sessions disabled.
 	SessionStore *session.Store

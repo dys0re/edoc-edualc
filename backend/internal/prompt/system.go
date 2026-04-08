@@ -57,6 +57,15 @@ func BuildSystemPromptWithMemory(workDir string, memorySection string) string {
 	return sb.String()
 }
 
+// BuildSystemPromptWithSkills assembles the system prompt with memory and skill sections.
+func BuildSystemPromptWithSkills(workDir string, memorySection string, skillSection string) string {
+	base := BuildSystemPromptWithMemory(workDir, memorySection)
+	if skillSection == "" {
+		return base
+	}
+	return base + "\n<system-reminder>\n" + skillSection + "\n</system-reminder>\n"
+}
+
 func isGitRepo(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, ".git"))
 	return err == nil
