@@ -1,0 +1,5 @@
+.playwright-cli/
+.playwright/
+.claude/
+backend/config.yaml
+backend/config.yml

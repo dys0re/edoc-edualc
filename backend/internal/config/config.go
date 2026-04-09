@@ -28,9 +28,10 @@ type ServerConfig struct {
 }
 
 type ProviderConfig struct {
-	Default     string `mapstructure:"default"`       // 默认 provider: anthropic / openai
-	Model       string `mapstructure:"model"`          // 默认模型
-	ModelBackup string `mapstructure:"model_backup"`   // 限流时降级模型，空=不降级
+	Default     string   `mapstructure:"default"`       // 默认 provider: anthropic / openai
+	Model       string   `mapstructure:"model"`          // 默认模型
+	ModelBackup string   `mapstructure:"model_backup"`   // 限流时降级模型，空=不降级
+	Models      []string `mapstructure:"models"`         // 可用模型列表，空=只用 Model
 }
 
 type AnthropicConfig struct {

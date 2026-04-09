@@ -2,10 +2,15 @@ import type { Session, Model, SSEEvent } from './types'
 
 const BASE = ''
 
-export async function fetchModels(): Promise<Model[]> {
+export interface ModelsResponse {
+  models: Model[]
+  default: string
+}
+
+export async function fetchModels(): Promise<ModelsResponse> {
   const res = await fetch(`${BASE}/api/models`)
   const data = await res.json()
-  return data.models ?? []
+  return { models: data.models ?? [], default: data.default ?? '' }
 }
 
 export async function fetchSessions(): Promise<Session[]> {

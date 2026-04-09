@@ -328,25 +328,29 @@ func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// Models returns available models/providers.
+// Models returns available models from config.
 func (h *Handler) Models(c *gin.Context) {
-	models := []map[string]string{}
+	provider := h.cfg.Provider.Default
 
-	if h.cfg.Anthropic.APIKey != "" {
-		models = append(models,
-			map[string]string{"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-			map[string]string{"provider": "anthropic", "model": "claude-opus-4-20250514"},
-			map[string]string{"provider": "anthropic", "model": "claude-haiku-4-5-20251001"},
-		)
-	}
-	if h.cfg.OpenAI.APIKey != "" {
-		models = append(models,
-			map[string]string{"provider": "openai", "model": "gpt-4o"},
-			map[string]string{"provider": "openai", "model": "o3"},
-		)
+	// 优先用配置里的 models 列表
+	modelList := h.cfg.Provider.Models
+	if len(modelList) == 0 {
+		// 降级：只返回默认模型
+		modelList = []string{h.cfg.Provider.Model}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"models": models})
+	models := make([]map[string]string, 0, len(modelList))
+	for _, m := range modelList {
+		models = append(models, map[string]string{
+			"provider": provider,
+			"model":    m,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"models":  models,
+		"default": h.cfg.Provider.Model,
+	})
 }
 
 // CompactRequest is the request body for POST /api/compact.

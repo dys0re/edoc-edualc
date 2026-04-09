@@ -11,9 +11,10 @@ export default function App() {
   const [model, setModel] = useState('claude-sonnet-4-20250514')
 
   useEffect(() => {
-    fetchModels().then(ms => {
-      setModels(ms)
-      if (ms.length > 0) setModel(ms[0].model)
+    fetchModels().then(res => {
+      setModels(res.models)
+      if (res.default) setModel(res.default)
+      else if (res.models.length > 0) setModel(res.models[0].model)
     })
     fetchSessions().then(setSessions)
   }, [])
