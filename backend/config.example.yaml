@@ -30,6 +30,7 @@ tools:
   work_dir: "."       # 工具工作目录 (EDOC_TOOLS_WORK_DIR)
   shell: auto         # Shell: auto / powershell / bash / cmd (EDOC_TOOLS_SHELL)
   memory_dir: ""      # 记忆存储目录，空=自动推导 ~/.edoc/projects/<path>/memory/ (EDOC_TOOLS_MEMORY_DIR)
+  bocha_api_key: ""   # Bocha AI Search API key，用于 WebSearch 工具 (BOCHA_API_KEY)
 
 database:
   url: ""             # 完整连接串，优先级最高 (DATABASE_URL)

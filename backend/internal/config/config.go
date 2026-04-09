@@ -56,6 +56,7 @@ type ToolsConfig struct {
 	PermissionMode string   `mapstructure:"permission_mode"` // bypass / default / accept-edits / strict
 	AllowRules     []string `mapstructure:"allow_rules"`     // e.g. ["Read", "Bash:git *"]
 	PlansDir       string   `mapstructure:"plans_dir"`       // 计划文件目录，空=~/.edoc/plans/
+	BochaAPIKey    string   `mapstructure:"bocha_api_key"`   // Bocha AI Search API key
 }
 
 type DatabaseConfig struct {
@@ -127,6 +128,8 @@ func Load(configFile string) (*Config, error) {
 	_ = v.BindEnv("server.port", "EDOC_PORT")
 	// 数据库连接支持 DATABASE_URL（对标 Prisma/Drizzle 风格）
 	_ = v.BindEnv("database.url", "DATABASE_URL")
+	// Bocha AI Search API key
+	_ = v.BindEnv("tools.bocha_api_key", "BOCHA_API_KEY")
 
 	// 读配置文件（不存在不报错，纯环境变量也能跑）
 	if err := v.ReadInConfig(); err != nil {

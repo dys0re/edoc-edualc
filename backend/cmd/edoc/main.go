@@ -197,6 +197,7 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	reg.Register(tool.NewGrepTool())
 	reg.Register(tool.NewEditTool())
 	reg.Register(&tool.WebFetchTool{Provider: webFetchProvider})
+	reg.Register(&tool.WebSearchTool{APIKey: cfg.Tools.BochaAPIKey})
 
 	memStore := buildMemoryStore(pool, workDir)
 	sessStore := buildSessionStore(pool)
