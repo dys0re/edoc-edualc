@@ -69,6 +69,10 @@ type Config struct {
 	// TaskNotifier 提供后台任务完成通知。由 task.Manager 实现。
 	// nil = 后台任务不可用。对标 Claude Code 的 notification 注入机制。
 	TaskNotifier TaskNotifier
+
+	// TeamInbox 接收 teammate 消息。由 team.Manager.LeadInbox() 提供。
+	// nil = 不在团队中。对标 Claude Code 的 useInboxPoller。
+	TeamInbox <-chan tool.MailboxMessage
 }
 
 // TaskNotifier 提供后台任务通知 channel。由 task.Manager 实现。

@@ -12,6 +12,11 @@ type AgentTool struct {
 	// Resolver is called to create and run the sub-agent.
 	// Returns a channel of events (same as agent.Run).
 	Resolver AgentResolver
+
+	// TeamMgr enables teammate spawning. nil = teammate spawning disabled.
+	// When non-nil and the input includes team_name, spawns a long-lived
+	// in-process teammate instead of a one-shot sub-agent.
+	TeamMgr TeamManager
 }
 
 // AgentResolver is implemented by the agent package to run a sub-agent
@@ -60,9 +65,11 @@ type SubAgentEvent struct {
 
 // agentInput matches the LLM tool call schema.
 type agentInput struct {
-	Description string `json:"description"` // Short task description
-	Prompt      string `json:"prompt"`      // Full task prompt
+	Description  string `json:"description"`            // Short task description
+	Prompt       string `json:"prompt"`                 // Full task prompt
 	SubagentType string `json:"subagent_type,omitempty"` // Agent type (reserved)
+	Name         string `json:"name,omitempty"`          // Teammate name (for team spawning)
+	TeamName     string `json:"team_name,omitempty"`     // Target team (for team spawning)
 }
 
 func (t *AgentTool) Name() string        { return "Agent" }
@@ -80,16 +87,20 @@ func (t *AgentTool) InputSchema() map[string]interface{} {
 				"type":        "string",
 				"description": "The full task description for the sub-agent to perform",
 			},
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "Teammate name. Use with team_name to spawn a long-lived teammate instead of a one-shot sub-agent.",
+			},
+			"team_name": map[string]interface{}{
+				"type":        "string",
+				"description": "Team to spawn the teammate in. Requires name to also be set.",
+			},
 		},
 		"required": []string{"description", "prompt"},
 	}
 }
 
 func (t *AgentTool) Execute(ctx context.Context, input json.RawMessage) (*Result, error) {
-	if t.Resolver == nil {
-		return &Result{Content: "Error: Agent resolver not configured", IsError: true}, nil
-	}
-
 	var in agentInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &Result{Content: fmt.Sprintf("Error parsing input: %v", err), IsError: true}, nil
@@ -97,6 +108,31 @@ func (t *AgentTool) Execute(ctx context.Context, input json.RawMessage) (*Result
 
 	if in.Prompt == "" {
 		return &Result{Content: "Error: prompt is required", IsError: true}, nil
+	}
+
+	// Team spawning path: spawn a long-lived teammate instead of a one-shot sub-agent
+	if t.TeamMgr != nil && in.TeamName != "" {
+		if in.Name == "" {
+			return &Result{Content: "Error: name is required when team_name is specified", IsError: true}, nil
+		}
+		agentID, err := t.TeamMgr.SpawnTeammate(ctx, in.Name, in.TeamName, in.Prompt, "")
+		if err != nil {
+			return &Result{Content: fmt.Sprintf("Error spawning teammate: %v", err), IsError: true}, nil
+		}
+		return &Result{
+			Content: fmt.Sprintf("Teammate spawned successfully. agent_id: %s. name: %s. team: %s. The teammate is now running and will receive instructions via mailbox.", agentID, in.Name, in.TeamName),
+			Metadata: map[string]string{
+				"agent_id":  agentID,
+				"type":      "teammate_spawned",
+				"name":      in.Name,
+				"team_name": in.TeamName,
+			},
+		}, nil
+	}
+
+	// Standard one-shot sub-agent path
+	if t.Resolver == nil {
+		return &Result{Content: "Error: Agent resolver not configured", IsError: true}, nil
 	}
 
 	// Build sub-agent params — caller (the agent loop) fills in Model, Tools, etc.

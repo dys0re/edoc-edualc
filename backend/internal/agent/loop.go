@@ -81,6 +81,18 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 			}
 		}
 
+		// ── 1.6 Teammate inbox ──
+		// 对标 Claude Code 的 useInboxPoller — 非阻塞检查 teammate 消息
+		if cfg.TeamInbox != nil {
+			select {
+			case msg := <-cfg.TeamInbox:
+				formatted := formatTeamInboxMessage(msg)
+				state.Messages = append(state.Messages, message.NewUserMessage(formatted))
+				ch <- Event{Type: "warning", Delta: "[teammate: " + msg.From + "] " + msg.Summary}
+			default:
+			}
+		}
+
 		// ── 2. MaxTurns 检查 ──
 		// 对标 query.ts:1705
 		if cfg.MaxTurns > 0 && state.TurnCount >= cfg.MaxTurns {
@@ -687,4 +699,13 @@ func runSingle(ctx context.Context, reg *tool.Registry, block *message.ToolUseBl
 func formatTaskNotification(notif task.TaskNotification) string {
 	return fmt.Sprintf("<system-reminder>\nBackground task completed:\n- Task ID: %s\n- Type: %s\n- Status: %s\n- %s\nUse TaskOutput with task_id %q to read the output.\n</system-reminder>",
 		notif.TaskID, notif.TaskType, notif.Status, notif.Message, notif.TaskID)
+}
+
+// formatTeamInboxMessage 格式化 teammate 消息为 user message。
+// 对标 Claude Code 的 <teammate-message> XML 注入。
+func formatTeamInboxMessage(msg tool.MailboxMessage) string {
+	return fmt.Sprintf(
+		"<teammate-message from=%q from_id=%q type=%q summary=%q>\n%s\n</teammate-message>",
+		msg.From, msg.FromID, msg.Type, msg.Summary, msg.Text,
+	)
 }

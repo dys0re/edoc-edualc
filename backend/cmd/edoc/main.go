@@ -25,6 +25,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/dysorder/edoc-edualc/backend/internal/skill"
 	"github.com/dysorder/edoc-edualc/backend/internal/task"
+	"github.com/dysorder/edoc-edualc/backend/internal/team"
 	"github.com/dysorder/edoc-edualc/backend/internal/token"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -172,7 +173,7 @@ func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store, 
 }
 
 // buildAgentConfig 组装 agent.Config (with Agent tool wired in).
-func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback) (agent.Config, *task.Manager) {
+func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback) (agent.Config, *task.Manager, *team.Manager) {
 	workDir := cfg.Tools.WorkDir
 	if workDir == "." {
 		workDir, _ = os.Getwd()
@@ -296,9 +297,17 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 
 	// Wire Agent tool with subagent resolver (references the config being built)
 	resolver := agent.NewSubagentResolver(agentCfg)
-	reg.Register(&tool.AgentTool{Resolver: resolver})
 
-	return agentCfg, taskMgr
+	// Team management: 对标 Claude Code 的 TeamCreate + TeammateMailbox
+	teamMgr := team.NewManager(agentCfg)
+	reg.Register(&tool.TeamCreateTool{Manager: teamMgr})
+	reg.Register(&tool.TeamDeleteTool{Manager: teamMgr})
+	reg.Register(&tool.SendMessageTool{Manager: teamMgr})
+	agentCfg.TeamInbox = teamMgr.LeadInbox()
+
+	reg.Register(&tool.AgentTool{Resolver: resolver, TeamMgr: teamMgr})
+
+	return agentCfg, taskMgr, teamMgr
 }
 
 // buildPermissionCallback creates a REPL permission callback that reads y/n from stdin.
@@ -378,8 +387,9 @@ func buildPromptEvaluator(p provider.Provider, defaultModel string) hook.PromptE
 // runOnce executes a single prompt and exits. Maps to `claude -p "..."`.
 func runOnce(cfg *config.Config, pool *pgxpool.Pool, userPrompt string) {
 	scanner := bufio.NewScanner(os.Stdin)
-	agentCfg, taskMgr := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner))
+	agentCfg, taskMgr, teamMgr := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner))
 	defer taskMgr.Close()
+	defer teamMgr.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -613,15 +623,17 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 			history = loaded
 			fmt.Printf("Loaded %d messages from history.\n", len(history))
 
-			agentCfg, taskMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+			agentCfg, taskMgr, teamMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
 			defer taskMgr.Close()
+			defer teamMgr.Close()
 			history = runAgentLoop(scanner, agentCfg, history)
 			continue
 		}
 
 		// ── Normal prompt ──
-		agentCfg, taskMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
+		agentCfg, taskMgr, teamMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner))
 			defer taskMgr.Close()
+			defer teamMgr.Close()
 
 		// UserPromptSubmit hooks: 在用户提交 prompt 后、agent 执行前触发
 		if agentCfg.HookRunner != nil {
