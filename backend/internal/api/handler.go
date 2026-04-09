@@ -59,7 +59,7 @@ func (h *Handler) ChatSSE(c *gin.Context) {
 	cfg := agent.Config{
 		Provider:           p,
 		Registry:           reg,
-		SystemPrompt:       prompt.BuildSystemPrompt(h.workDir),
+		SystemPrompt:       prompt.BuildSystemPromptFull(prompt.QuickEnvContext(h.workDir), "", ""),
 		Model:              model,
 		MaxTokens:          8192,
 		PermissionMode:     tool.ParsePermissionMode(h.cfg.Tools.PermissionMode),
@@ -239,7 +239,7 @@ func (h *Handler) SessionChatSSE(c *gin.Context) {
 	cfg := agent.Config{
 		Provider:           p,
 		Registry:           reg,
-		SystemPrompt:       prompt.BuildSystemPrompt(h.workDir),
+		SystemPrompt:       prompt.BuildSystemPromptFull(prompt.QuickEnvContext(h.workDir), "", ""),
 		Model:              model,
 		MaxTokens:          8192,
 		SessionStore:       h.sessionStore,

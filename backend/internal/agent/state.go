@@ -5,6 +5,7 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/lsp"
 	"github.com/dysorder/edoc-edualc/backend/internal/memory"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
+	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/dysorder/edoc-edualc/backend/internal/skill"
@@ -32,6 +33,10 @@ type Config struct {
 
 	// MemoryStore is the PG-backed memory store. nil = memory disabled.
 	MemoryStore *memory.Store
+
+	// MemoryDir is the file-based memory directory for auto-extraction after compact.
+	// Empty = auto-extraction disabled.
+	MemoryDir string
 
 	// SkillRegistry holds loaded skills for the SkillTool.
 	// nil = skill system disabled.
@@ -95,6 +100,20 @@ type State struct {
 	HasAttemptedFallback         bool // 是否已尝试过 fallback model
 	HasAttemptedCompactRecovery  bool // 是否已尝试过 compact 恢复 prompt_too_long
 	ServerErrorRetries           int  // 5xx 重试计数，上限 3
+
+	// CompactWarning: 已发出过接近上下文限制的警告，避免重复发
+	CompactWarningSent bool
+
+	// EarlyToolResults 存储 StreamingToolExecutor 提前执行完成的工具结果。
+	// key = tool_use block ID，在 consumeStream 里填充，executeTools 里复用。
+	EarlyToolResults map[string]toolExecResult
+
+	// SnippetInjected 追踪本轮已注入的 snippet ID，防止同一轮重复注入。
+	// 每轮 loop 开始时重置。
+	SnippetInjected map[prompt.SnippetID]bool
+
+	// LastCoreRefreshTurn 记录上次核心规范刷新的轮次
+	LastCoreRefreshTurn int
 }
 
 // Event is emitted by the agent loop to the caller (CLI or Web handler).

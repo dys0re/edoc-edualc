@@ -12,6 +12,7 @@ import (
 
 	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/message"
+	"github.com/dysorder/edoc-edualc/backend/internal/prompt"
 	"github.com/dysorder/edoc-edualc/backend/internal/provider"
 	"github.com/dysorder/edoc-edualc/backend/internal/task"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
@@ -106,6 +107,16 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		state.TurnCount++
 		prevMsgCount = len(state.Messages)
 
+		// ── 2.5 Snippet 注入: 每轮重置 + 核心规范定时刷新 ──
+		// 对抗 sparse attention 遗忘：每 N 轮把核心规范重新注入到近端 context
+		state.SnippetInjected = make(map[prompt.SnippetID]bool)
+		if snip := prompt.CoreRefreshSnippet(state.TurnCount); snip != nil {
+			reminder := prompt.FormatSnippetsAsReminder([]prompt.Snippet{*snip})
+			state.Messages = append(state.Messages, message.NewUserMessage(reminder))
+			state.SnippetInjected[snip.ID] = true
+			state.LastCoreRefreshTurn = state.TurnCount
+		}
+
 		// ── 3. Microcompact: 清空旧 tool_result 内容 ──
 		// 对标 query.ts:414 deps.microcompact call
 		state.Messages = compact.Microcompact(state.Messages, 10)
@@ -114,6 +125,17 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		// 对标 query.ts:454 deps.autocompact call
 		if cfg.AutoCompactThreshold > 0 {
 			tokenCount := token.EstimateMessages(state.Messages)
+
+			// compactWarning: 达到阈值 80% 时提前警告，对标 compactWarningState.ts
+			warnThreshold := cfg.AutoCompactThreshold * 80 / 100
+			if !state.CompactWarningSent && tokenCount > warnThreshold {
+				state.CompactWarningSent = true
+				ch <- Event{
+					Type:  "warning",
+					Delta: fmt.Sprintf("Context is getting long (~%d tokens, threshold %d). Consider /compact.", tokenCount, cfg.AutoCompactThreshold),
+				}
+			}
+
 			if tokenCount > cfg.AutoCompactThreshold {
 				// PreCompact hook
 				if cfg.HookRunner != nil {
@@ -126,8 +148,23 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 				}
 				result, err := compact.Compact(ctx, compactCfg, state.Messages, "")
 				if err == nil {
+					// SessionMemory 自动提取：compact 前的消息中提取记忆，后台运行不阻塞
+					// 对标 services/extractMemories/ + sessionMemoryCompact.ts
+					if cfg.MemoryDir != "" {
+						preMsgs := state.Messages
+						go func() {
+							extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+							defer cancel()
+							n, _ := compact.ExtractMemories(extractCtx, compactCfg, preMsgs, cfg.MemoryDir)
+							if n > 0 {
+								ch <- Event{Type: "warning", Delta: fmt.Sprintf("[memory: extracted %d memories from conversation]", n)}
+							}
+						}()
+					}
+
 					state.Messages = result.NewMessages
-					prevMsgCount = 0 // compact 后全部是新消息
+					prevMsgCount = 0
+					state.CompactWarningSent = false // 压缩后重置警告状态
 					ch <- Event{Type: "compacted", Message: &message.Message{
 						Role: message.RoleSystem,
 						Content: []message.ContentBlock{{
@@ -368,6 +405,24 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 			}
 		}
 
+		// ── 11.5 Contextual snippet 注入: 根据即将执行的工具语义绑定规范 ──
+		// 对抗 sparse attention: snippet 文本和当前操作绑定，提高 attention 权重
+		for _, tu := range toolUseBlocks {
+			var inputMap map[string]interface{}
+			json.Unmarshal(tu.Input, &inputMap)
+			snippets := prompt.SnippetsForTool(tu.Name, inputMap)
+			var newSnippets []prompt.Snippet
+			for _, s := range snippets {
+				if !state.SnippetInjected[s.ID] {
+					state.SnippetInjected[s.ID] = true
+					newSnippets = append(newSnippets, s)
+				}
+			}
+			if reminder := prompt.FormatSnippetsAsReminder(newSnippets); reminder != "" {
+				state.Messages = append(state.Messages, message.NewUserMessage(reminder))
+			}
+		}
+
 		// ── 12. 执行 tools ──
 		results := executeTools(ctx, cfg.Registry, toolUseBlocks)
 
@@ -491,7 +546,9 @@ func persistNewMessages(ctx context.Context, cfg Config, state *State, prevMsgCo
 }
 
 // consumeStream 消费流式响应，返回 assistant 消息、tool_use blocks、stop reason。
-// 如果遇到可恢复错误，返回 recovered=true，调用方应 continue 重试。
+// 对并发安全工具实现 StreamingToolExecutor：收到 tool_use 事件时立即启动执行，
+// 不等 message_complete，减少工具执行延迟。
+// 对标 services/tools/StreamingToolExecutor.ts
 func consumeStream(
 	streamCh <-chan provider.StreamEvent,
 	ctx context.Context,
@@ -500,6 +557,13 @@ func consumeStream(
 	ch chan<- Event,
 	currentModel *string,
 ) (assistantMsg *message.Message, toolUseBlocks []*message.ToolUseBlock, stopReason string, recovered bool) {
+	type earlyResult struct {
+		block  *message.ToolUseBlock
+		result toolExecResult
+	}
+	earlyResults := make(map[string]toolExecResult) // toolUseID → result
+	var earlyWg sync.WaitGroup
+
 	for evt := range streamCh {
 		switch evt.Type {
 		case "text_delta":
@@ -509,6 +573,21 @@ func consumeStream(
 		case "tool_use":
 			ch <- Event{Type: "tool_use", ToolName: evt.ToolUse.Name, ToolInput: string(evt.ToolUse.Input)}
 			toolUseBlocks = append(toolUseBlocks, evt.ToolUse)
+
+			// StreamingToolExecutor: 并发安全工具立即启动，不等 message_complete
+			if t, err := cfg.Registry.Get(evt.ToolUse.Name); err == nil && t.IsConcurrencySafe(evt.ToolUse.Input) {
+				block := evt.ToolUse
+				earlyWg.Add(1)
+				go func() {
+					defer earlyWg.Done()
+					r := runSingle(ctx, cfg.Registry, block)
+					// 用 mutex 保护 map 写入
+					earlyMu.Lock()
+					earlyResults[block.ID] = r
+					earlyMu.Unlock()
+				}()
+			}
+
 		case "message_complete":
 			assistantMsg = evt.Message
 			stopReason = evt.StopReason
@@ -520,8 +599,21 @@ func consumeStream(
 			return nil, nil, "", false
 		}
 	}
+
+	// 等待所有提前启动的工具完成
+	earlyWg.Wait()
+
+	// 将提前完成的结果注入 toolUseBlocks（供调用方跳过重复执行）
+	// 通过在 block 上打标记实现：把已完成的结果存回 state
+	if len(earlyResults) > 0 {
+		state.EarlyToolResults = earlyResults
+	}
+
 	return assistantMsg, toolUseBlocks, stopReason, false
 }
+
+// earlyMu 保护 earlyResults map 的并发写入
+var earlyMu sync.Mutex
 
 // handleProviderError 处理 Provider 错误，尝试恢复。
 // 返回 true 表示已恢复（应 continue 重试），false 表示不可恢复（已发出 error event）。
@@ -622,16 +714,25 @@ type toolExecResult struct {
 // executeTools runs tool calls, respecting concurrency safety.
 // Maps to toolOrchestration.ts:19 runTools.
 func executeTools(ctx context.Context, reg *tool.Registry, blocks []*message.ToolUseBlock) []toolExecResult {
+	return executeToolsWithEarly(ctx, reg, blocks, nil)
+}
+
+// executeToolsWithEarly reuses results already computed by StreamingToolExecutor
+// (concurrent-safe tools started during stream consumption), then executes the rest.
+func executeToolsWithEarly(ctx context.Context, reg *tool.Registry, blocks []*message.ToolUseBlock, early map[string]toolExecResult) []toolExecResult {
 	type batch struct {
 		concurrent bool
 		blocks     []*message.ToolUseBlock
 	}
 
+	// Build batches for blocks NOT already completed
 	var batches []batch
 	for _, b := range blocks {
+		if _, done := early[b.ID]; done {
+			continue
+		}
 		t, err := reg.Get(b.Name)
 		isSafe := err == nil && t.IsConcurrencySafe(b.Input)
-
 		if isSafe && len(batches) > 0 && batches[len(batches)-1].concurrent {
 			batches[len(batches)-1].blocks = append(batches[len(batches)-1].blocks, b)
 		} else {
@@ -639,13 +740,28 @@ func executeTools(ctx context.Context, reg *tool.Registry, blocks []*message.Too
 		}
 	}
 
-	var results []toolExecResult
+	// Execute remaining blocks
+	var remaining []toolExecResult
 	for _, bat := range batches {
 		if bat.concurrent && len(bat.blocks) > 1 {
-			results = append(results, runConcurrent(ctx, reg, bat.blocks)...)
+			remaining = append(remaining, runConcurrent(ctx, reg, bat.blocks)...)
 		} else {
 			for _, b := range bat.blocks {
-				results = append(results, runSingle(ctx, reg, b))
+				remaining = append(remaining, runSingle(ctx, reg, b))
+			}
+		}
+	}
+
+	// Merge: preserve original block order, substituting early results where available
+	results := make([]toolExecResult, 0, len(blocks))
+	ri := 0
+	for _, b := range blocks {
+		if r, done := early[b.ID]; done {
+			results = append(results, r)
+		} else {
+			if ri < len(remaining) {
+				results = append(results, remaining[ri])
+				ri++
 			}
 		}
 	}

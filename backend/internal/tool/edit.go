@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/dysorder/edoc-edualc/backend/internal/snapshot"
 )
 
 // EditTool performs exact string replacement in files.
@@ -15,7 +17,9 @@ import (
 //   - Curly quote normalization (API transmission can mangle quotes)
 //   - Trailing whitespace stripping on old_string
 //   - replace_all support
-type EditTool struct{}
+type EditTool struct {
+	Snapshots *snapshot.Store // nil = snapshots disabled
+}
 
 func NewEditTool() *EditTool { return &EditTool{} }
 
@@ -65,6 +69,11 @@ func (t *EditTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 
 	if in.OldString == in.NewString {
 		return &Result{Content: "No changes to make: old_string and new_string are exactly the same.", IsError: true}, nil
+	}
+
+	// 修改前保存快照
+	if t.Snapshots != nil {
+		t.Snapshots.Save(in.FilePath, "Edit") //nolint:errcheck
 	}
 
 	// Read file

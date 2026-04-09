@@ -7,9 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/dysorder/edoc-edualc/backend/internal/snapshot"
 )
 
-type WriteTool struct{}
+type WriteTool struct {
+	Snapshots *snapshot.Store // nil = snapshots disabled
+}
 
 func NewWriteTool() *WriteTool { return &WriteTool{} }
 
@@ -45,6 +49,11 @@ func (t *WriteTool) Execute(_ context.Context, input json.RawMessage) (*Result, 
 	var in writeInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return &Result{Content: fmt.Sprintf("Invalid input: %v", err), IsError: true}, nil
+	}
+
+	// 写入前保存快照（原始内容或"文件不存在"）
+	if t.Snapshots != nil {
+		t.Snapshots.Save(in.FilePath, "Write") //nolint:errcheck
 	}
 
 	dir := filepath.Dir(in.FilePath)
