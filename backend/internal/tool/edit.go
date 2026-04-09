@@ -142,8 +142,8 @@ func (t *EditTool) IsFileEdit(_ json.RawMessage) bool { return true }
 //  1. Exact match
 //  2. Curly quote normalization (API can convert " → \u201C/\u201D)
 //  3. Trailing whitespace stripped match
-//  4. Tab→space normalization (the #1 Edit failure cause)
-//  5. Combined tab normalization + trailing whitespace strip
+//  4. Indentation normalization — both directions (tabs↔spaces), handles the #1 Edit failure cause
+//  5. Combined indentation normalization + trailing whitespace strip
 //
 // Returns the actual string found in content (may differ from oldString in whitespace).
 func findActualString(content, oldString string) (string, error) {
@@ -168,35 +168,32 @@ func findActualString(content, oldString string) (string, error) {
 
 	// Strategy 3: Strip trailing whitespace from each line of oldString
 	strippedOld := stripTrailingWhitespace(oldString)
-	if strippedOld != oldString && strings.Contains(content, strippedOld) {
-		return strippedOld, nil
-	}
-
-	// Strategy 4: Normalize tabs to spaces
-	tabNormOld := normalizeIndentation(oldString)
-	tabNormContent := normalizeIndentation(content)
-
-	if tabNormOld != oldString {
-		idx := strings.Index(tabNormContent, tabNormOld)
-		if idx >= 0 {
-			actual, err := mapBackToOriginal(content, tabNormContent, idx, len(tabNormOld))
-			if err == nil {
-				return actual, nil
-			}
+	strippedContent := stripTrailingWhitespace(content)
+	if strippedOld != oldString {
+		if idx := strings.Index(strippedContent, strippedOld); idx >= 0 {
+			return mapBackByStripping(content, strippedContent, idx, len(strippedOld)), nil
 		}
 	}
 
-	// Strategy 5: Combined — normalize tabs + strip trailing whitespace
-	if strippedOld != oldString && tabNormOld != oldString {
-		combinedOld := normalizeIndentation(strippedOld)
-		if combinedOld != tabNormOld {
-			idx := strings.Index(tabNormContent, combinedOld)
-			if idx >= 0 {
-				actual, err := mapBackToOriginal(content, tabNormContent, idx, len(combinedOld))
-				if err == nil {
-					return actual, nil
-				}
-			}
+	// Strategy 4: Normalize indentation (tabs↔spaces, both directions).
+	// We normalize both old_string and file content to a canonical form (tabs→spaces),
+	// then search. This handles:
+	//   - model sends spaces, file uses tabs
+	//   - model sends tabs, file uses spaces
+	normOld := normalizeIndentation(oldString)
+	normContent := normalizeIndentation(content)
+	if idx := strings.Index(normContent, normOld); idx >= 0 {
+		if actual, err := mapBackToOriginal(content, normContent, idx, len(normOld)); err == nil {
+			return actual, nil
+		}
+	}
+
+	// Strategy 5: Combined — normalize indentation + strip trailing whitespace
+	combinedOld := normalizeIndentation(strippedOld)
+	combinedContent := normalizeIndentation(strippedContent)
+	if idx := strings.Index(combinedContent, combinedOld); idx >= 0 {
+		if actual, err := mapBackToOriginal(content, combinedContent, idx, len(combinedOld)); err == nil {
+			return actual, nil
 		}
 	}
 
@@ -280,6 +277,82 @@ func mapBackToOriginal(original, normalized string, normIdx, normLen int) (strin
 	}
 
 	return original[startOrig:origIdx], nil
+}
+
+// mapBackByStripping maps a match position in trailing-whitespace-stripped content
+// back to the actual substring in the original content.
+func mapBackByStripping(original, stripped string, strippedIdx, strippedLen int) string {
+	origIdx := 0
+	stripPos := 0
+
+	// Advance to start position
+	for origIdx < len(original) && stripPos < strippedIdx {
+		if original[origIdx] == '\r' {
+			origIdx++
+			continue
+		}
+		origIdx++
+		stripPos++
+	}
+	startOrig := origIdx
+
+	// Advance to end position
+	endStrip := strippedIdx + strippedLen
+	for origIdx < len(original) && stripPos < endStrip {
+		if original[origIdx] == '\r' {
+			origIdx++
+			continue
+		}
+		origIdx++
+		stripPos++
+	}
+
+	if origIdx > len(original) {
+		return original[startOrig:]
+	}
+	return original[startOrig:origIdx]
+}
+
+// spacesToTabs converts leading spaces to tabs on each line.
+// Used to fix LLM-generated code which typically uses spaces, while Go convention is tabs.
+// Detects indent width from the first indented line (2 or 4 spaces).
+func spacesToTabs(s string) string {
+	lines := strings.Split(s, "\n")
+	indentWidth := detectIndentWidth(lines)
+	if indentWidth == 0 {
+		return s
+	}
+	indent := strings.Repeat(" ", indentWidth)
+	for i, line := range lines {
+		var tabs int
+		for strings.HasPrefix(line, indent) {
+			tabs++
+			line = line[indentWidth:]
+		}
+		if tabs > 0 {
+			lines[i] = strings.Repeat("\t", tabs) + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func detectIndentWidth(lines []string) int {
+	for _, line := range lines {
+		if len(line) == 0 || line[0] != ' ' {
+			continue
+		}
+		spaces := 0
+		for spaces < len(line) && line[spaces] == ' ' {
+			spaces++
+		}
+		if spaces >= 2 {
+			if spaces%4 == 0 {
+				return 4
+			}
+			return 2
+		}
+	}
+	return 0
 }
 
 func stripTrailingWhitespace(s string) string {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type WriteTool struct{}
@@ -51,7 +52,15 @@ func (t *WriteTool) Execute(_ context.Context, input json.RawMessage) (*Result, 
 		return &Result{Content: fmt.Sprintf("Error creating directory: %v", err), IsError: true}, nil
 	}
 
-	if err := os.WriteFile(in.FilePath, []byte(in.Content), 0644); err != nil {
+	content := in.Content
+
+	// Auto-fix indentation for Go files: convert leading spaces to tabs.
+	// LLMs typically generate space-indented code, but Go convention is tabs.
+	if strings.HasSuffix(strings.ToLower(in.FilePath), ".go") {
+		content = spacesToTabs(content)
+	}
+
+	if err := os.WriteFile(in.FilePath, []byte(content), 0644); err != nil {
 		return &Result{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}, nil
 	}
 
