@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: #0f1117;
+  color: #ececec;
+  font-family: system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  height: 100dvh;
+  display: flex;
+}
+
+/* markdown 渲染 */
+.prose pre {
+  background: #1e1f2e;
+  border: 1px solid #2e3044;
+  border-radius: 6px;
+  padding: 12px 16px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.prose code:not(pre code) {
+  background: #1e1f2e;
+  border: 1px solid #2e3044;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.875em;
+}
+
+.prose p { margin: 0.5em 0; }
+.prose p:first-child { margin-top: 0; }
+.prose p:last-child { margin-bottom: 0; }
+.prose ul, .prose ol { padding-left: 1.5em; margin: 0.5em 0; }
+.prose li { margin: 0.2em 0; }
+.prose h1, .prose h2, .prose h3 { margin: 0.8em 0 0.4em; font-weight: 600; }
+.prose blockquote { border-left: 3px solid #4a4d6e; padding-left: 1em; color: #9ca3af; margin: 0.5em 0; }
+.prose a { color: #818cf8; text-decoration: underline; }
+.prose table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+.prose th, .prose td { border: 1px solid #2e3044; padding: 6px 12px; text-align: left; }
+.prose th { background: #1e1f2e; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2e3044; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #4a4d6e; }
