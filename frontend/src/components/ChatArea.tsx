@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { MessageBubble, type ChatMessage } from './MessageBubble'
 import { ChatInput } from './ChatInput'
-import { streamChat, streamSessionChat } from '../api'
+import { streamChat, streamSessionChat, loadSession } from '../api'
 import type { SSEEvent, Model } from '../types'
 
 interface Props {
@@ -12,20 +12,69 @@ interface Props {
   onSessionCreated?: (id: string) => void
 }
 
+// 把后端 message.ContentBlock[] 格式转成前端 ChatMessage
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function convertMessages(raw: any[]): ChatMessage[] {
+  const result: ChatMessage[] = []
+  for (const msg of raw) {
+    if (msg.role !== 'user' && msg.role !== 'assistant') continue
+    const blocks: { type: string; text?: { text: string }; tool_use?: { name: string; input: unknown }; tool_result?: { content: string; is_error: boolean } }[] = msg.content ?? []
+
+    let text = ''
+    const toolCalls: ChatMessage['toolCalls'] = []
+
+    for (const block of blocks) {
+      if (block.type === 'text' && block.text?.text) {
+        text += block.text.text
+      } else if (block.type === 'tool_use' && block.tool_use) {
+        toolCalls.push({ name: block.tool_use.name })
+      } else if (block.type === 'tool_result' && block.tool_result) {
+        // 匹配上一个 tool_use
+        if (toolCalls.length > 0) {
+          const last = toolCalls[toolCalls.length - 1]
+          if (!last.result) {
+            toolCalls[toolCalls.length - 1] = {
+              ...last,
+              result: block.tool_result.content,
+              isError: block.tool_result.is_error,
+            }
+          }
+        }
+      }
+    }
+
+    result.push({
+      role: msg.role,
+      content: text,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    })
+  }
+  return result
+}
+
 export function ChatArea({ sessionId, model, models, onModelChange, onSessionCreated }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+  const [loading, setLoading] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const prevSessionId = useRef<string | null>(null)
 
-  // Reset messages when session changes
+  // 切换会话时加载历史消息
   useEffect(() => {
-    if (prevSessionId.current !== sessionId) {
-      prevSessionId.current = sessionId
-      setMessages([])
-    }
+    if (prevSessionId.current === sessionId) return
+    prevSessionId.current = sessionId
+    setMessages([])
+    if (!sessionId) return
+
+    setLoading(true)
+    loadSession(sessionId)
+      .then(data => {
+        setMessages(convertMessages(data.messages ?? []))
+      })
+      .catch(() => { /* session may not exist yet */ })
+      .finally(() => setLoading(false))
   }, [sessionId])
 
   // Auto-scroll to bottom
@@ -161,7 +210,11 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-6">
-        {messages.length === 0 ? (
+        {loading ? (
+          <div className="h-full flex items-center justify-center">
+            <div className="w-5 h-5 border-2 border-[#4f46e5] border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center gap-3">
             <div className="w-12 h-12 rounded-2xl bg-[#1e2030] flex items-center justify-center">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#818cf8" strokeWidth="1.5">
