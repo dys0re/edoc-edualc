@@ -49,6 +49,7 @@ export default function App() {
         model={model}
         models={models}
         onModelChange={setModel}
+        onNew={handleNew}
       />
     </div>
   )

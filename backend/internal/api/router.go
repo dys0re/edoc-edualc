@@ -7,14 +7,15 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/remote"
 	"github.com/dysorder/edoc-edualc/backend/internal/session"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // NewRouter creates the Gin engine with all routes.
-func NewRouter(p provider.Provider, cfg *config.Config, workDir string, memoryStore *memory.Store, sessionStore *session.Store) *gin.Engine {
+func NewRouter(p provider.Provider, cfg *config.Config, workDir string, memoryStore *memory.Store, sessionStore *session.Store, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.Default()
 	r.Use(CORSMiddleware())
 
-	h := NewHandler(p, cfg, workDir, memoryStore, sessionStore)
+	h := NewHandler(p, cfg, workDir, memoryStore, sessionStore, pool)
 
 	// Remote session manager (shared across all WS connections)
 	remoteMgr := remote.NewManager()
@@ -34,6 +35,7 @@ func NewRouter(p provider.Provider, cfg *config.Config, workDir string, memorySt
 		api.DELETE("/sessions/:id", h.DeleteSession)
 		api.PATCH("/sessions/:id", h.UpdateSession)
 		api.POST("/sessions/:id/chat", h.SessionChatSSE)
+		api.POST("/sessions/:id/compact", h.SessionCompactSSE)
 
 		// Remote sessions (WebSocket)
 		api.GET("/remote", rh.ListSessions)
@@ -42,6 +44,7 @@ func NewRouter(p provider.Provider, cfg *config.Config, workDir string, memorySt
 
 		// Other
 		api.POST("/compact", h.CompactSSE)
+		api.POST("/command", h.Command)
 		api.GET("/models", h.Models)
 	}
 

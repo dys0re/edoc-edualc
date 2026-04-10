@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,11 +10,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 
 	"github.com/dysorder/edoc-edualc/backend/internal/agent"
 	"github.com/dysorder/edoc-edualc/backend/internal/api"
+	"github.com/dysorder/edoc-edualc/backend/internal/command"
 	"github.com/dysorder/edoc-edualc/backend/internal/compact"
 	"github.com/dysorder/edoc-edualc/backend/internal/config"
 	"github.com/dysorder/edoc-edualc/backend/internal/db"
@@ -31,7 +30,6 @@ import (
 	"github.com/dysorder/edoc-edualc/backend/internal/snapshot"
 	"github.com/dysorder/edoc-edualc/backend/internal/task"
 	"github.com/dysorder/edoc-edualc/backend/internal/team"
-	"github.com/dysorder/edoc-edualc/backend/internal/token"
 	"github.com/dysorder/edoc-edualc/backend/internal/tool"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -149,12 +147,17 @@ func buildSessionStore(pool *pgxpool.Pool) *session.Store {
 	return session.NewStore(pool)
 }
 
-// buildSkillRegistry 加载 skill 注册表
+// buildSkillRegistry 加载 skill 注册表（用户 skill 优先于内置 skill）
 func buildSkillRegistry(workDir string) *skill.Registry {
 	dirs := skill.DefaultDirs(workDir)
 	reg, err := skill.Load(dirs)
 	if err != nil || reg == nil {
-		return skill.NewRegistry()
+		reg = skill.NewRegistry()
+	}
+	// 注册内置 skill（commit, review 等）
+	// Register 不会覆盖同名的用户 skill，用户定义优先
+	for _, s := range skill.BuiltinSkills() {
+		reg.Register(s)
 	}
 	return reg
 }
@@ -600,32 +603,7 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 		}
 
 		if input == "/help" {
-			fmt.Println("Commands:")
-			fmt.Println("  /new                  Start a new session")
-			fmt.Println("  /sessions             List saved sessions")
-			fmt.Println("  /session              Show current session info")
-			fmt.Println("  /resume <id>          Resume a saved session")
-			fmt.Println("  /clear                Clear conversation history")
-			fmt.Println("  /compact              Compact conversation context")
-			fmt.Println("  /model <name>         Switch model")
-			fmt.Println("  /cost                 Show token usage estimate")
-			fmt.Println("  /memory               Show loaded memory")
-			fmt.Println("  /commit [msg]         Stage all and commit (git)")
-			fmt.Println("  /diff [args]          Show git diff")
-			fmt.Println("  /review [ref]         Review git diff with AI")
-			fmt.Println("  /branch [name]        List or create git branch")
-			fmt.Println("  /init                 Initialize .edoc/settings.json")
-			fmt.Println("  /doctor               Check environment and config")
-			fmt.Println("  /mcp                  List MCP servers")
-			fmt.Println("  /hooks                List configured hooks")
-			fmt.Println("  /permissions          Show permission mode and rules")
-			fmt.Println("  /config               Show current configuration")
-			fmt.Println("  /tasks                List background tasks")
-			fmt.Println("  /rewind [n]           Restore last n file snapshots (default 1)")
-			fmt.Println("  /rewind list          List all recorded snapshots")
-			fmt.Println("  /fast                 Toggle fast (backup) model")
-			fmt.Println("  /effort <low|med|high> Switch effort level")
-			fmt.Println("  /quit, /exit          Exit")
+			fmt.Println(command.Help())
 			continue
 		}
 
@@ -636,8 +614,7 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 		}
 
 		if input == "/cost" {
-			est := token.EstimateMessages(history)
-			fmt.Printf("Estimated tokens in context: ~%d\n", est)
+			fmt.Println(command.Cost(history))
 			continue
 		}
 
@@ -675,23 +652,7 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 		}
 
 		if input == "/memory" {
-			memStore := buildMemoryStore(pool, workDir)
-			var section string
-			if memStore != nil {
-				section = memory.BuildMemoryPromptSectionPG(context.Background(), memStore)
-			}
-			if section == "" {
-				memDir := cfg.Tools.MemoryDir
-				if memDir == "" {
-					memDir = memory.GetMemoryDir(workDir)
-				}
-				section = memory.BuildMemoryPromptSection(memDir)
-			}
-			if section == "" {
-				fmt.Println("No memory loaded.")
-			} else {
-				fmt.Println(section)
-			}
+			fmt.Println(command.Memory(pool, workDir, cfg))
 			continue
 		}
 
@@ -782,91 +743,130 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 
 		// ── P0/P1 slash commands ──
 		if input == "/session" {
-			cmdSession(currentSessionID, sessStore, currentModel)
+			fmt.Println(command.Session(currentSessionID, sessStore, currentModel))
 			continue
 		}
 
 		if strings.HasPrefix(input, "/commit") {
 			args := strings.Fields(strings.TrimPrefix(input, "/commit"))
-			cmdCommit(workDir, args)
+			if len(args) == 0 {
+				// Interactive: prompt for message
+				fmt.Print("Commit message: ")
+				if !scanner.Scan() {
+					continue
+				}
+				msg := strings.TrimSpace(scanner.Text())
+				if msg == "" {
+					fmt.Fprintln(os.Stderr, "Commit message cannot be empty.")
+					continue
+				}
+				args = []string{msg}
+			}
+			out, err := command.Commit(workDir, args)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			} else {
+				fmt.Println(out)
+			}
 			continue
 		}
 
 		if strings.HasPrefix(input, "/diff") {
 			args := strings.Fields(strings.TrimPrefix(input, "/diff"))
-			cmdDiff(workDir, args)
+			out, err := command.Diff(workDir, args)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			} else {
+				fmt.Println(out)
+			}
 			continue
 		}
 
 		if strings.HasPrefix(input, "/branch") {
 			args := strings.Fields(strings.TrimPrefix(input, "/branch"))
-			cmdBranch(workDir, args)
+			out, err := command.Branch(workDir, args)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			} else {
+				fmt.Println(out)
+			}
 			continue
 		}
 
 		if input == "/init" {
-			cmdInit(workDir)
+			out, err := command.Init(workDir)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			} else {
+				fmt.Println(out)
+			}
 			continue
 		}
 
 		if input == "/doctor" {
-			cmdDoctor(cfg, workDir, pool)
+			fmt.Println(command.Doctor(cfg, workDir, pool))
 			continue
 		}
 
 		if input == "/mcp" {
-			cmdMCP(cfg)
+			fmt.Println(command.MCP(cfg))
 			continue
 		}
 
 		if input == "/hooks" {
-			cmdHooks(workDir)
+			out, err := command.Hooks(workDir)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			} else {
+				fmt.Println(out)
+			}
 			continue
 		}
 
 		if input == "/permissions" {
-			cmdPermissions(cfg)
+			fmt.Println(command.Permissions(cfg))
 			continue
 		}
 
 		if input == "/config" {
-			cmdConfig(cfg)
+			fmt.Println(command.Config(cfg))
 			continue
 		}
 
 		if input == "/tasks" {
-			cmdTasks(replTaskMgr)
+			fmt.Println(command.Tasks(replTaskMgr))
 			continue
 		}
 
 		if strings.HasPrefix(input, "/rewind") {
 			args := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(input, "/rewind"), " "))
-			cmdRewind(replSnapStore, args)
+			out, err := command.Rewind(replSnapStore, args)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			} else {
+				fmt.Println(out)
+			}
 			continue
 		}
 
 		if input == "/fast" {
-			// 切换到 fast 模式：使用 backup model（更快更便宜）
-			if cfg.Provider.ModelBackup != "" {
-				cfg.Provider.Model, cfg.Provider.ModelBackup = cfg.Provider.ModelBackup, cfg.Provider.Model
-				currentModel = cfg.Provider.Model
-				fmt.Printf("Fast mode: switched to %s\n", currentModel)
-			} else {
-				fmt.Println("No backup model configured (set provider.model_backup in config).")
-			}
+			newModel, out := command.Fast(cfg)
+			currentModel = newModel
+			fmt.Println(out)
 			continue
 		}
 
 		if strings.HasPrefix(input, "/effort ") {
 			level := strings.TrimSpace(strings.TrimPrefix(input, "/effort "))
-			cmdEffort(cfg, level)
-			currentModel = cfg.Provider.Model
+			newModel, out := command.Effort(cfg, level)
+			currentModel = newModel
+			fmt.Println(out)
 			continue
 		}
 
 		if strings.HasPrefix(input, "/review") {
 			args := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(input, "/review"), " "))
-			diff, err := cmdReviewDiff(workDir, args)
+			diff, err := command.ReviewDiff(workDir, args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				continue
@@ -957,7 +957,7 @@ func runServer(cfg *config.Config, pool *pgxpool.Pool) {
 	memStore := buildMemoryStore(pool, workDir)
 	sessStore := buildSessionStore(pool)
 
-	r := api.NewRouter(p, cfg, workDir, memStore, sessStore)
+	r := api.NewRouter(p, cfg, workDir, memStore, sessStore, pool)
 	fmt.Printf("Starting server on :%d (model: %s)\n", cfg.Server.Port, cfg.Provider.Model)
 	if pool != nil {
 		fmt.Println("db: connected")
@@ -966,428 +966,6 @@ func runServer(cfg *config.Config, pool *pgxpool.Pool) {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-// gitRun runs a git command in workDir and returns combined output.
-func gitRun(workDir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = workDir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-	return strings.TrimRight(out.String(), "\n"), err
-}
-
-// cmdCommit implements /commit — stages all changes and commits with a message.
-func cmdCommit(workDir string, args []string) {
-	// Collect staged + unstaged status
-	status, err := gitRun(workDir, "status", "--short")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "git status: %v\n", err)
-		return
-	}
-	if status == "" {
-		fmt.Println("Nothing to commit.")
-		return
-	}
-	fmt.Println(status)
-
-	var msg string
-	if len(args) > 0 {
-		msg = strings.Join(args, " ")
-	} else {
-		fmt.Print("Commit message: ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if !scanner.Scan() {
-			return
-		}
-		msg = strings.TrimSpace(scanner.Text())
-	}
-	if msg == "" {
-		fmt.Fprintln(os.Stderr, "Commit message cannot be empty.")
-		return
-	}
-
-	if out, err := gitRun(workDir, "add", "-A"); err != nil {
-		fmt.Fprintf(os.Stderr, "git add: %v\n%s\n", err, out)
-		return
-	}
-	out, err := gitRun(workDir, "commit", "-m", msg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "git commit: %v\n%s\n", err, out)
-		return
-	}
-	fmt.Println(out)
-}
-
-// cmdDiff implements /diff — shows git diff (staged or unstaged).
-func cmdDiff(workDir string, args []string) {
-	gitArgs := []string{"diff"}
-	if len(args) > 0 {
-		gitArgs = append(gitArgs, args...)
-	}
-	out, err := gitRun(workDir, gitArgs...)
-	if err != nil && out == "" {
-		fmt.Fprintf(os.Stderr, "git diff: %v\n", err)
-		return
-	}
-	if out == "" {
-		fmt.Println("No changes.")
-		return
-	}
-	fmt.Println(out)
-}
-
-// cmdSession implements /session — shows current session info.
-func cmdSession(currentSessionID string, sessStore *session.Store, currentModel string) {
-	if currentSessionID == "" {
-		fmt.Println("No active session (database not available or not started).")
-		fmt.Printf("Model: %s\n", currentModel)
-		return
-	}
-	fmt.Printf("Session: %s\n", currentSessionID)
-	fmt.Printf("Model:   %s\n", currentModel)
-	if sessStore != nil {
-		sess, err := sessStore.Get(context.Background(), currentSessionID)
-		if err == nil {
-			if sess.Title != "" {
-				fmt.Printf("Title:   %s\n", sess.Title)
-			}
-			fmt.Printf("Created: %s\n", sess.CreatedAt.Format("2006-01-02 15:04:05"))
-			fmt.Printf("Updated: %s\n", sess.UpdatedAt.Format("2006-01-02 15:04:05"))
-		}
-	}
-}
-
-// cmdBranch implements /branch — lists or creates git branches.
-func cmdBranch(workDir string, args []string) {
-	if len(args) == 0 {
-		// List branches
-		out, err := gitRun(workDir, "branch", "-v")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "git branch: %v\n", err)
-			return
-		}
-		fmt.Println(out)
-		return
-	}
-	// Create branch
-	out, err := gitRun(workDir, "checkout", "-b", args[0])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "git checkout -b: %v\n%s\n", err, out)
-		return
-	}
-	fmt.Println(out)
-}
-
-// cmdInit implements /init — initializes .edoc/settings.json if not present.
-func cmdInit(workDir string) {
-	edocDir := filepath.Join(workDir, ".edoc")
-	settingsPath := filepath.Join(edocDir, "settings.json")
-
-	if _, err := os.Stat(settingsPath); err == nil {
-		fmt.Printf("Already initialized: %s\n", settingsPath)
-		return
-	}
-
-	if err := os.MkdirAll(edocDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", edocDir, err)
-		return
-	}
-
-	template := `{
-  "hooks": {}
-}
-`
-	if err := os.WriteFile(settingsPath, []byte(template), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "write %s: %v\n", settingsPath, err)
-		return
-	}
-	fmt.Printf("Created %s\n", settingsPath)
-}
-
-// cmdDoctor implements /doctor — checks environment and configuration.
-func cmdDoctor(cfg *config.Config, workDir string, pool *pgxpool.Pool) {
-	ok := true
-	check := func(label string, pass bool, detail string) {
-		if pass {
-			fmt.Printf("  [ok] %s\n", label)
-		} else {
-			fmt.Printf("  [!!] %s — %s\n", label, detail)
-			ok = false
-		}
-	}
-
-	fmt.Println("edoc doctor")
-	fmt.Println()
-
-	// API key
-	switch cfg.Provider.Default {
-	case "anthropic":
-		check("Anthropic API key", cfg.Anthropic.APIKey != "", "set ANTHROPIC_API_KEY")
-	case "openai":
-		check("OpenAI API key", cfg.OpenAI.APIKey != "", "set OPENAI_API_KEY")
-	}
-
-	// Database
-	check("Database", pool != nil, "PostgreSQL not connected (sessions/memory disabled)")
-
-	// Work dir
-	_, wdErr := os.Stat(workDir)
-	check("Work directory", wdErr == nil, fmt.Sprintf("%s not accessible", workDir))
-
-	// Git
-	_, gitErr := gitRun(workDir, "rev-parse", "--git-dir")
-	check("Git repository", gitErr == nil, "not a git repo")
-
-	// .edoc/settings.json
-	settingsPath := filepath.Join(workDir, ".edoc", "settings.json")
-	_, settingsErr := os.Stat(settingsPath)
-	check(".edoc/settings.json", settingsErr == nil, "run /init to create")
-
-	fmt.Println()
-	if ok {
-		fmt.Println("All checks passed.")
-	} else {
-		fmt.Println("Some checks failed.")
-	}
-}
-
-// cmdMCP implements /mcp — lists configured MCP servers and their tools.
-func cmdMCP(cfg *config.Config) {
-	if len(cfg.MCPServers) == 0 {
-		fmt.Println("No MCP servers configured.")
-		fmt.Println("Add mcp_servers to config.yaml to enable MCP.")
-		return
-	}
-
-	names := make([]string, 0, len(cfg.MCPServers))
-	for name := range cfg.MCPServers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		srv := cfg.MCPServers[name]
-		t := srv.Type
-		if t == "" {
-			t = "stdio"
-		}
-		fmt.Printf("  %s  [%s]", name, t)
-		if srv.Command != "" {
-			fmt.Printf("  %s", srv.Command)
-		} else if srv.URL != "" {
-			fmt.Printf("  %s", srv.URL)
-		}
-		fmt.Println()
-	}
-}
-
-// cmdHooks implements /hooks — lists configured hooks.
-func cmdHooks(workDir string) {
-	hooksCfg, err := hook.LoadSettings(workDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading hooks: %v\n", err)
-		return
-	}
-	if len(hooksCfg) == 0 {
-		fmt.Println("No hooks configured.")
-		fmt.Printf("Edit %s to add hooks.\n", hook.SettingsPath(workDir))
-		return
-	}
-
-	// Sort events for stable output
-	events := make([]string, 0, len(hooksCfg))
-	for ev := range hooksCfg {
-		events = append(events, string(ev))
-	}
-	sort.Strings(events)
-
-	for _, ev := range events {
-		matchers := hooksCfg[hook.HookEvent(ev)]
-		fmt.Printf("%s:\n", ev)
-		for _, m := range matchers {
-			matcher := m.Matcher
-			if matcher == "" {
-				matcher = "*"
-			}
-			for _, h := range m.Hooks {
-				async := ""
-				if h.Async {
-					async = " [async]"
-				}
-				switch h.Type {
-				case "command":
-					fmt.Printf("  [%s] command: %s%s\n", matcher, h.Command, async)
-				case "http":
-					fmt.Printf("  [%s] http: %s%s\n", matcher, h.URL, async)
-				case "prompt":
-					fmt.Printf("  [%s] prompt: %s%s\n", matcher, h.Prompt, async)
-				}
-			}
-		}
-	}
-}
-
-// cmdPermissions implements /permissions — shows current permission mode and allow rules.
-func cmdPermissions(cfg *config.Config) {
-	fmt.Printf("Permission mode: %s\n", cfg.Tools.PermissionMode)
-	if len(cfg.Tools.AllowRules) == 0 {
-		fmt.Println("Allow rules: (none)")
-	} else {
-		fmt.Println("Allow rules:")
-		for _, r := range cfg.Tools.AllowRules {
-			fmt.Printf("  %s\n", r)
-		}
-	}
-}
-
-// cmdConfig implements /config — shows current configuration (redacts secrets).
-func cmdConfig(cfg *config.Config) {
-	apiKey := func(k string) string {
-		if k == "" {
-			return "(not set)"
-		}
-		if len(k) > 8 {
-			return k[:4] + "..." + k[len(k)-4:]
-		}
-		return "****"
-	}
-
-	fmt.Printf("provider:    %s\n", cfg.Provider.Default)
-	fmt.Printf("model:       %s\n", cfg.Provider.Model)
-	if cfg.Provider.ModelBackup != "" {
-		fmt.Printf("model_backup: %s\n", cfg.Provider.ModelBackup)
-	}
-	fmt.Printf("anthropic_key: %s\n", apiKey(cfg.Anthropic.APIKey))
-	if cfg.Anthropic.BaseURL != "" {
-		fmt.Printf("anthropic_url: %s\n", cfg.Anthropic.BaseURL)
-	}
-	fmt.Printf("openai_key:  %s\n", apiKey(cfg.OpenAI.APIKey))
-	if cfg.OpenAI.BaseURL != "" {
-		fmt.Printf("openai_url:  %s\n", cfg.OpenAI.BaseURL)
-	}
-	fmt.Printf("work_dir:    %s\n", cfg.Tools.WorkDir)
-	fmt.Printf("shell:       %s\n", cfg.Tools.Shell)
-	fmt.Printf("permission:  %s\n", cfg.Tools.PermissionMode)
-	fmt.Printf("server_port: %d\n", cfg.Server.Port)
-	if cfg.Agent.MaxTurns > 0 {
-		fmt.Printf("max_turns:   %d\n", cfg.Agent.MaxTurns)
-	}
-	if cfg.Agent.AutoCompactThreshold > 0 {
-		fmt.Printf("auto_compact: %d tokens\n", cfg.Agent.AutoCompactThreshold)
-	}
-	dbStatus := "not connected"
-	if cfg.Database.URL != "" || cfg.Database.Host != "" {
-		dbStatus = fmt.Sprintf("%s:%d/%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
-	}
-	fmt.Printf("database:    %s\n", dbStatus)
-}
-
-// cmdTasks implements /tasks — lists background tasks.
-func cmdTasks(taskMgr *task.Manager) {
-	if taskMgr == nil {
-		fmt.Println("No task manager available.")
-		return
-	}
-	tasks := taskMgr.List()
-	if len(tasks) == 0 {
-		fmt.Println("No background tasks.")
-		return
-	}
-	for _, t := range tasks {
-		end := ""
-		if t.EndTime != nil {
-			end = fmt.Sprintf(" → %s", t.EndTime.Format("15:04:05"))
-		}
-		fmt.Printf("  %s  [%s]  %s  %s%s\n",
-			t.ID, t.Status, t.StartTime.Format("15:04:05"), t.Description, end)
-	}
-}
-
-// cmdRewind implements /rewind [n] — restores the last n file snapshots.
-// n defaults to 1. Use /rewind list to show all snapshots.
-func cmdRewind(store *snapshot.Store, args []string) {
-	if store == nil {
-		fmt.Println("Snapshot system not available.")
-		return
-	}
-
-	if len(args) > 0 && args[0] == "list" {
-		snaps := store.List()
-		if len(snaps) == 0 {
-			fmt.Println("No snapshots recorded.")
-			return
-		}
-		fmt.Printf("%d snapshot(s):\n", len(snaps))
-		for _, s := range snaps {
-			exists := "(deleted)"
-			if s.BlobHash != "" {
-				exists = s.BlobHash[:8]
-			}
-			fmt.Printf("  %s  %s  [%s]  %s\n", s.ID, s.CreatedAt.Format("15:04:05"), s.ToolName, exists+" "+s.FilePath)
-		}
-		return
-	}
-
-	n := 1
-	if len(args) > 0 {
-		fmt.Sscanf(args[0], "%d", &n)
-		if n < 1 {
-			n = 1
-		}
-	}
-
-	restored, errs := store.RewindN(n)
-	for _, s := range restored {
-		fmt.Printf("  restored  %s  (%s)\n", s.FilePath, s.ToolName)
-	}
-	for _, e := range errs {
-		fmt.Fprintf(os.Stderr, "  error: %v\n", e)
-	}
-	if len(restored) == 0 && len(errs) == 0 {
-		fmt.Println("No snapshots to rewind.")
-	}
-}
-
-// cmdEffort implements /effort <low|medium|high> — switches model tier.
-func cmdEffort(cfg *config.Config, level string) {
-	switch strings.ToLower(level) {
-	case "low":
-		if cfg.Provider.ModelBackup != "" {
-			cfg.Provider.Model = cfg.Provider.ModelBackup
-			fmt.Printf("Effort low: switched to %s\n", cfg.Provider.Model)
-		} else {
-			fmt.Println("No backup model configured for low effort.")
-		}
-	case "medium":
-		// medium = default model (no-op if already there)
-		fmt.Printf("Effort medium: using %s\n", cfg.Provider.Model)
-	case "high":
-		fmt.Printf("Effort high: using %s (no higher model configured)\n", cfg.Provider.Model)
-	default:
-		fmt.Fprintf(os.Stderr, "Usage: /effort <low|medium|high>\n")
-	}
-}
-
-// cmdReviewDiff returns the diff to review. args can be empty (HEAD diff) or a ref/path.
-func cmdReviewDiff(workDir string, args []string) (string, error) {
-	gitArgs := []string{"diff"}
-	if len(args) > 0 {
-		gitArgs = append(gitArgs, args...)
-	} else {
-		// Default: staged + unstaged changes vs HEAD
-		gitArgs = append(gitArgs, "HEAD")
-	}
-	out, err := gitRun(workDir, gitArgs...)
-	if err != nil && out == "" {
-		return "", fmt.Errorf("git diff: %v", err)
-	}
-	if out == "" {
-		return "", fmt.Errorf("no changes to review")
-	}
-	return out, nil
 }
 
 // runAgentLoop runs a multi-turn agent loop in the REPL with existing messages.

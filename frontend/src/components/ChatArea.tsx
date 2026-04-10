@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { MessageBubble, type ChatMessage, type ContentBlock } from './MessageBubble'
 import { ChatInput } from './ChatInput'
-import { streamChat, streamSessionChat, loadSession } from '../api'
+import { streamChat, streamSessionChat, loadSession, executeCommand, compactSession } from '../api'
 import type { SSEEvent, Model } from '../types'
 
 interface Props {
@@ -10,6 +10,7 @@ interface Props {
   models: Model[]
   onModelChange: (m: string) => void
   onSessionCreated?: (id: string) => void
+  onNew?: () => void
 }
 
 // 把后端 message.ContentBlock[] 格式转成前端 ChatMessage
@@ -119,7 +120,7 @@ function convertMessages(raw: any[]): ChatMessage[] {
   return result
 }
 
-export function ChatArea({ sessionId, model, models, onModelChange, onSessionCreated }: Props) {
+export function ChatArea({ sessionId, model, models, onModelChange, onSessionCreated, onNew }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
@@ -149,10 +150,247 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // 添加系统消息（命令输出）
+  const addSystemMessage = useCallback((text: string) => {
+    setMessages(prev => [...prev, {
+      role: 'assistant',
+      blocks: [{ type: 'text', text }],
+    }])
+  }, [])
+
+  // SSE event handlers (shared between normal chat and /review)
+  const buildOnEvent = useCallback(() => (evt: SSEEvent) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const e = evt as any
+    if (e.type === 'text_delta') {
+      setMessages(prev => {
+        const next = [...prev]
+        const last = next[next.length - 1]
+        if (last?.role !== 'assistant') return prev
+        const blocks = [...last.blocks]
+        const lastBlock = blocks[blocks.length - 1]
+        if (lastBlock?.type === 'text') {
+          blocks[blocks.length - 1] = { ...lastBlock, text: (lastBlock.text ?? '') + e.delta }
+        } else {
+          blocks.push({ type: 'text', text: e.delta })
+        }
+        next[next.length - 1] = { ...last, blocks }
+        return next
+      })
+    } else if (e.type === 'tool_use') {
+      setMessages(prev => {
+        const next = [...prev]
+        const last = next[next.length - 1]
+        if (last?.role !== 'assistant') return prev
+        const blocks = [...last.blocks, {
+          type: 'tool_call' as const,
+          toolName: e.tool_name,
+          toolInput: e.tool_input,
+          toolUseId: e.tool_use_id,
+        }]
+        next[next.length - 1] = { ...last, blocks }
+        return next
+      })
+    } else if (e.type === 'tool_result') {
+      setMessages(prev => {
+        const next = [...prev]
+        const last = next[next.length - 1]
+        if (last?.role !== 'assistant') return prev
+        const blocks = [...last.blocks]
+        let matched = false
+        if (e.tool_use_id) {
+          for (let i = 0; i < blocks.length; i++) {
+            if (blocks[i].type === 'tool_call' && blocks[i].toolUseId === e.tool_use_id) {
+              blocks[i] = { ...blocks[i], toolResult: e.content, toolIsError: e.is_error }
+              matched = true
+              break
+            }
+          }
+        }
+        if (!matched) {
+          for (let i = 0; i < blocks.length; i++) {
+            if (blocks[i].type === 'tool_call' && blocks[i].toolResult === undefined) {
+              blocks[i] = { ...blocks[i], toolResult: e.content, toolIsError: e.is_error }
+              break
+            }
+          }
+        }
+        next[next.length - 1] = { ...last, blocks }
+        return next
+      })
+    } else if (e.type === 'error') {
+      setMessages(prev => {
+        const next = [...prev]
+        const last = next[next.length - 1]
+        if (last?.role !== 'assistant') return prev
+        const blocks = [...last.blocks]
+        blocks.push({ type: 'text', text: `Error: ${e.error || 'Unknown error'}` })
+        next[next.length - 1] = { ...last, blocks, isStreaming: false }
+        return next
+      })
+    }
+  }, [])
+
+  const buildOnDone = useCallback(() => () => {
+    setStreaming(false)
+    setMessages(prev => {
+      const next = [...prev]
+      const last = next[next.length - 1]
+      if (last?.role === 'assistant') {
+        next[next.length - 1] = { ...last, isStreaming: false }
+      }
+      return next
+    })
+    abortRef.current = null
+  }, [])
+
+  const buildOnError = useCallback(() => (err: string) => {
+    setStreaming(false)
+    setMessages(prev => {
+      const next = [...prev]
+      const last = next[next.length - 1]
+      if (last?.role === 'assistant') {
+        next[next.length - 1] = {
+          ...last,
+          blocks: [...last.blocks, { type: 'text', text: `Error: ${err}` }],
+          isStreaming: false,
+        }
+      }
+      return next
+    })
+    abortRef.current = null
+  }, [])
+
   const handleSubmit = useCallback(() => {
     const prompt = input.trim()
     if (!prompt || streaming) return
     setInput('')
+
+    // --- 斜杠命令拦截 ---
+    if (prompt.startsWith('/')) {
+      const parts = prompt.split(/\s+/)
+      const cmd = parts[0]
+
+      // 前端直接处理
+      if (cmd === '/clear') {
+        setMessages([])
+        return
+      }
+      if (cmd === '/help') {
+        addSystemMessage(`Commands:
+  /new                  Start a new session
+  /clear                Clear conversation history
+  /compact              Compact conversation context
+  /model <name>         Switch model
+  /cost                 Show token usage estimate
+  /config               Show current configuration
+  /doctor               Check environment and config
+  /diff [args]          Show git diff
+  /branch [name]        List or create git branch
+  /commit <msg>         Stage all and commit (git)
+  /review [ref]         Review git diff with AI
+  /mcp                  List MCP servers
+  /hooks                List configured hooks
+  /permissions          Show permission mode and rules
+  /session              Show current session info
+  /memory               Show loaded memory
+  /tasks                List background tasks
+  /init                 Initialize .edoc/settings.json
+  /fast                 Toggle fast (backup) model
+  /effort <low|med|high> Switch effort level`)
+        return
+      }
+      if (cmd === '/model' && parts.length > 1) {
+        onModelChange(parts[1])
+        addSystemMessage(`Model switched to: ${parts[1]}`)
+        return
+      }
+      if (cmd === '/new') {
+        onNew?.()
+        return
+      }
+
+      // /compact — SSE
+      if (cmd === '/compact') {
+        if (!sessionId) {
+          addSystemMessage('No active session to compact.')
+          return
+        }
+        addSystemMessage('Compacting...')
+        setStreaming(true)
+        compactSession(
+          sessionId,
+          (evt) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const e = evt as any
+            if (e.type === 'compact_complete') {
+              setMessages(prev => {
+                const next = [...prev]
+                next[next.length - 1] = {
+                  role: 'assistant',
+                  blocks: [{ type: 'text', text: `Compacted: ~${e.pre_compact_tokens} → ~${e.post_compact_tokens} tokens` }],
+                }
+                return next
+              })
+            } else if (e.type === 'error') {
+              addSystemMessage(`Compact error: ${e.error}`)
+            }
+          },
+          () => {
+            setStreaming(false)
+            // 重新加载 session 消息
+            if (sessionId) {
+              loadSession(sessionId).then(data => {
+                setMessages(convertMessages(data.messages ?? []))
+              }).catch(() => {})
+            }
+          },
+          (err) => {
+            setStreaming(false)
+            addSystemMessage(`Compact error: ${err}`)
+          },
+        )
+        return
+      }
+
+      // /commit 和 /review — 走模型（通过 skill 系统）
+      // 模型看到 system-reminder 里的 skill 列表，会自动调用 Skill("commit") 或 Skill("review")
+      if (cmd === '/commit' || cmd === '/review') {
+        const args = parts.slice(1).join(' ')
+        const skillPrompt = cmd === '/commit'
+          ? (args ? `Please commit my changes with message: ${args}` : 'Please commit my current changes to git.')
+          : (args ? `Please review the changes: ${args}` : 'Please review my current code changes.')
+        // 作为普通 prompt 发送，模型会通过 skill 系统处理
+        setMessages(prev => [...prev, { role: 'user', blocks: [{ type: 'text', text: prompt }] }])
+        setMessages(prev => [...prev, { role: 'assistant', blocks: [], isStreaming: true }])
+        setStreaming(true)
+        const onEvent = buildOnEvent()
+        const onDone = buildOnDone()
+        const onError = buildOnError()
+        if (sessionId) {
+          abortRef.current = streamSessionChat(sessionId, skillPrompt, model, onEvent, onDone, onError)
+        } else {
+          abortRef.current = streamChat(skillPrompt, model, onEvent, onDone, onError)
+        }
+        onSessionCreated?.(sessionId ?? '')
+        return
+      }
+
+      // 其他命令 — 走后端 /api/command
+      setMessages(prev => [...prev, { role: 'user', blocks: [{ type: 'text', text: prompt }] }])
+      ;(async () => {
+        const resp = await executeCommand(prompt, sessionId ?? undefined, model)
+        const text = resp.error ? `Error: ${resp.error}` : (resp.output || '(no output)')
+        addSystemMessage(text)
+        // 处理 action
+        if (resp.action === 'model_changed' && resp.data?.model) {
+          onModelChange(resp.data.model)
+        }
+      })()
+      return
+    }
+
+    // --- 正常 prompt ---
 
     // Add user message
     setMessages(prev => [...prev, { role: 'user', blocks: [{ type: 'text', text: prompt }] }])
@@ -161,112 +399,9 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
     setMessages(prev => [...prev, { role: 'assistant', blocks: [], isStreaming: true }])
     setStreaming(true)
 
-    const onEvent = (evt: SSEEvent) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const e = evt as any
-      if (e.type === 'text_delta') {
-        setMessages(prev => {
-          const next = [...prev]
-          const last = next[next.length - 1]
-          if (last?.role !== 'assistant') return prev
-          const blocks = [...last.blocks]
-          const lastBlock = blocks[blocks.length - 1]
-          if (lastBlock?.type === 'text') {
-            // append to existing text block
-            blocks[blocks.length - 1] = { ...lastBlock, text: (lastBlock.text ?? '') + e.delta }
-          } else {
-            // create new text block (after a tool_call, or first block)
-            blocks.push({ type: 'text', text: e.delta })
-          }
-          next[next.length - 1] = { ...last, blocks }
-          return next
-        })
-      } else if (e.type === 'tool_use') {
-        setMessages(prev => {
-          const next = [...prev]
-          const last = next[next.length - 1]
-          if (last?.role !== 'assistant') return prev
-          const blocks = [...last.blocks, {
-            type: 'tool_call' as const,
-            toolName: e.tool_name,
-            toolInput: e.tool_input,
-            toolUseId: e.tool_use_id,
-          }]
-          next[next.length - 1] = { ...last, blocks }
-          return next
-        })
-      } else if (e.type === 'tool_result') {
-        setMessages(prev => {
-          const next = [...prev]
-          const last = next[next.length - 1]
-          if (last?.role !== 'assistant') return prev
-          const blocks = [...last.blocks]
-          // match by tool_use_id (robust) or fall back to first unresolved (forward search)
-          let matched = false
-          if (e.tool_use_id) {
-            for (let i = 0; i < blocks.length; i++) {
-              if (blocks[i].type === 'tool_call' && blocks[i].toolUseId === e.tool_use_id) {
-                blocks[i] = { ...blocks[i], toolResult: e.content, toolIsError: e.is_error }
-                matched = true
-                break
-              }
-            }
-          }
-          if (!matched) {
-            // fallback: forward search for first unresolved tool_call
-            for (let i = 0; i < blocks.length; i++) {
-              if (blocks[i].type === 'tool_call' && blocks[i].toolResult === undefined) {
-                blocks[i] = { ...blocks[i], toolResult: e.content, toolIsError: e.is_error }
-                break
-              }
-            }
-          }
-          next[next.length - 1] = { ...last, blocks }
-          return next
-        })
-      } else if (e.type === 'error') {
-        setMessages(prev => {
-          const next = [...prev]
-          const last = next[next.length - 1]
-          if (last?.role !== 'assistant') return prev
-          const blocks = [...last.blocks]
-          const errText = e.error || 'Unknown error'
-          blocks.push({ type: 'text', text: `Error: ${errText}` })
-          next[next.length - 1] = { ...last, blocks, isStreaming: false }
-          return next
-        })
-      }
-    }
-
-    const onDone = () => {
-      setStreaming(false)
-      setMessages(prev => {
-        const next = [...prev]
-        const last = next[next.length - 1]
-        if (last?.role === 'assistant') {
-          next[next.length - 1] = { ...last, isStreaming: false }
-        }
-        return next
-      })
-      abortRef.current = null
-    }
-
-    const onError = (err: string) => {
-      setStreaming(false)
-      setMessages(prev => {
-        const next = [...prev]
-        const last = next[next.length - 1]
-        if (last?.role === 'assistant') {
-          next[next.length - 1] = {
-            ...last,
-            blocks: [...last.blocks, { type: 'text', text: `Error: ${err}` }],
-            isStreaming: false,
-          }
-        }
-        return next
-      })
-      abortRef.current = null
-    }
+    const onEvent = buildOnEvent()
+    const onDone = buildOnDone()
+    const onError = buildOnError()
 
     if (sessionId) {
       abortRef.current = streamSessionChat(sessionId, prompt, model, onEvent, onDone, onError)
@@ -274,7 +409,7 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
       abortRef.current = streamChat(prompt, model, onEvent, onDone, onError)
     }
     onSessionCreated?.(sessionId ?? '')
-  }, [input, streaming, sessionId, model, onSessionCreated])
+  }, [input, streaming, sessionId, model, onSessionCreated, onModelChange, onNew, addSystemMessage])
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort()

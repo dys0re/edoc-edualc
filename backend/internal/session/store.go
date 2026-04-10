@@ -187,3 +187,35 @@ func (s *Store) Delete(ctx context.Context, sessionID string) error {
 	}
 	return nil
 }
+
+// ReplaceMessages deletes all messages for a session and inserts new ones (for compact).
+func (s *Store) ReplaceMessages(ctx context.Context, sessionID string, msgs []message.Message) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM messages WHERE session_id = $1`, sessionID); err != nil {
+		return fmt.Errorf("delete old messages: %w", err)
+	}
+
+	for i, msg := range msgs {
+		contentJSON, err := json.Marshal(msg.Content)
+		if err != nil {
+			return fmt.Errorf("marshal message[%d]: %w", i, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO messages (session_id, role, seq, content) VALUES ($1, $2, $3, $4)`,
+			sessionID, string(msg.Role), i+1, contentJSON,
+		); err != nil {
+			return fmt.Errorf("insert message[%d]: %w", i, err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET updated_at = now() WHERE id = $1`, sessionID); err != nil {
+		return fmt.Errorf("update session timestamp: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}

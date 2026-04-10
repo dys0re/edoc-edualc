@@ -58,6 +58,18 @@ func (r *Registry) Names() []string {
 	return names
 }
 
+// Register adds a skill to the registry. If a skill with the same name
+// already exists (e.g. loaded from a user file), it is NOT overwritten —
+// user-defined skills take priority over builtins.
+func (r *Registry) Register(s *Skill) {
+	if r == nil || s == nil {
+		return
+	}
+	if _, exists := r.skills[s.Name]; !exists {
+		r.skills[s.Name] = s
+	}
+}
+
 // Len returns the number of loaded skills.
 func (r *Registry) Len() int {
 	if r == nil {

@@ -131,3 +131,50 @@ async function readSSE(
   }
   onDone()
 }
+
+// --- Slash command API ---
+
+export interface CommandResponse {
+  output: string
+  error?: string
+  action?: string
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data?: any
+}
+
+export async function executeCommand(command: string, sessionId?: string, model?: string): Promise<CommandResponse> {
+  const res = await fetch(`${BASE}/api/command`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command, session_id: sessionId, model }),
+  })
+  return res.json()
+}
+
+export function compactSession(
+  sessionId: string,
+  onEvent: (evt: SSEEvent) => void,
+  onDone: () => void,
+  onError: (err: string) => void,
+): AbortController {
+  const ctrl = new AbortController()
+  ;(async () => {
+    try {
+      const res = await fetch(`${BASE}/api/sessions/${sessionId}/compact`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: ctrl.signal,
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        onError(data.error || `HTTP ${res.status}`)
+        return
+      }
+      await readSSE(res, onEvent, onDone)
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name !== 'AbortError') onError(e.message)
+    }
+  })()
+  return ctrl
+}
