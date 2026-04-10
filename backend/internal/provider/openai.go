@@ -39,10 +39,10 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 	}
 
 	params := openai.ChatCompletionRequest{
-		Model:     model,
-		Messages:  message.ToOpenAIMessages(req.Messages, req.SystemPrompt),
-		MaxTokens: maxTokens,
-		Stream:    true,
+		Model:               model,
+		Messages:            message.ToOpenAIMessages(req.Messages, req.SystemPrompt),
+		MaxCompletionTokens: maxTokens,
+		Stream:              true,
 	}
 
 	if len(req.Tools) > 0 {

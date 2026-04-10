@@ -62,6 +62,7 @@ func (h *Handler) ChatSSE(c *gin.Context) {
 		SystemPrompt:       prompt.BuildSystemPromptFull(prompt.QuickEnvContext(h.workDir), "", ""),
 		Model:              model,
 		MaxTokens:          8192,
+		WorkDir:            h.workDir,
 		PermissionMode:     tool.ParsePermissionMode(h.cfg.Tools.PermissionMode),
 		AllowRules:         h.cfg.Tools.AllowRules,
 		// API mode: no interactive callback — non-bypass tools are denied
@@ -226,8 +227,13 @@ func (h *Handler) SessionChatSSE(c *gin.Context) {
 		return
 	}
 
-	// Append new user message to history
-	msgs = append(msgs, message.NewUserMessage(req.Prompt))
+	// Append new user message to history and persist immediately
+	userMsg := message.NewUserMessage(req.Prompt)
+	msgs = append(msgs, userMsg)
+	if err := h.sessionStore.AppendMessages(c.Request.Context(), id, []message.Message{userMsg}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist user message: " + err.Error()})
+		return
+	}
 
 	model := req.Model
 	if model == "" {
@@ -242,6 +248,7 @@ func (h *Handler) SessionChatSSE(c *gin.Context) {
 		SystemPrompt:       prompt.BuildSystemPromptFull(prompt.QuickEnvContext(h.workDir), "", ""),
 		Model:              model,
 		MaxTokens:          8192,
+		WorkDir:            h.workDir,
 		SessionStore:       h.sessionStore,
 		SessionID:          id,
 		PermissionMode:     tool.ParsePermissionMode(h.cfg.Tools.PermissionMode),
@@ -299,9 +306,11 @@ func sseEvent(evt agent.Event) string {
 	case "tool_use":
 		payload["tool_name"] = evt.ToolName
 		payload["tool_input"] = evt.ToolInput
+		payload["tool_use_id"] = evt.ToolUseID
 	case "tool_result":
 		if evt.ToolResult != nil {
 			payload["tool_name"] = evt.ToolName
+			payload["tool_use_id"] = evt.ToolUseID
 			payload["content"] = evt.ToolResult.Content
 			payload["is_error"] = evt.ToolResult.IsError
 		}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { MessageBubble, type ChatMessage } from './MessageBubble'
+import { MessageBubble, type ChatMessage, type ContentBlock } from './MessageBubble'
 import { ChatInput } from './ChatInput'
 import { streamChat, streamSessionChat, loadSession } from '../api'
 import type { SSEEvent, Model } from '../types'
@@ -13,42 +13,109 @@ interface Props {
 }
 
 // 把后端 message.ContentBlock[] 格式转成前端 ChatMessage
+// 后端消息格式:
+//   - user text:    { role:"user", content:[{ type:"text", text:{text:"..."} }] }
+//   - assistant:    { role:"assistant", content:[{ type:"text",... }, { type:"tool_use",... }] }
+//   - tool result:  { role:"user", content:[{ type:"tool_result", tool_result:{tool_use_id, content, is_error} }] }
+// 一次 agent loop 产生多轮 assistant + tool_result 消息，合并为单个 ChatMessage 保持顺序。
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function convertMessages(raw: any[]): ChatMessage[] {
   const result: ChatMessage[] = []
+  let currentAssistant: ChatMessage | null = null
+  const toolBlockMap = new Map<string, number>() // tool_use_id → block index
+
+  // 判断一条 user 消息是否是 tool_result（而非普通 user text）
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function isToolResultMsg(msg: any): boolean {
+    const blocks = msg.content ?? []
+    return Array.isArray(blocks) && blocks.some((b: any) => b.type === 'tool_result')
+  }
+
+  // 判断一条 user 消息是否是 agent loop 内部注入的系统消息
+  // （snippet 注入、hook context、task notification 等，不应展示给用户）
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function isSystemInjectedMsg(msg: any): boolean {
+    const blocks = msg.content ?? []
+    if (!Array.isArray(blocks) || blocks.length === 0) return false
+    const text = blocks[0]?.text?.text ?? ''
+    if (!text) return false
+    return text.startsWith('<system-reminder>') ||
+      text.startsWith('<teammate-message') ||
+      text.startsWith('Output token limit hit') ||
+      text.startsWith('Stop hook blocking error') ||
+      text.startsWith('PostToolUse hook blocking error')
+  }
+
   for (const msg of raw) {
-    if (msg.role !== 'user' && msg.role !== 'assistant') continue
-    const blocks: { type: string; text?: { text: string }; tool_use?: { name: string; input: unknown }; tool_result?: { content: string; is_error: boolean } }[] = msg.content ?? []
-
-    let text = ''
-    const toolCalls: ChatMessage['toolCalls'] = []
-
-    for (const block of blocks) {
-      if (block.type === 'text' && block.text?.text) {
-        text += block.text.text
-      } else if (block.type === 'tool_use' && block.tool_use) {
-        toolCalls.push({ name: block.tool_use.name })
-      } else if (block.type === 'tool_result' && block.tool_result) {
-        // 匹配上一个 tool_use
-        if (toolCalls.length > 0) {
-          const last = toolCalls[toolCalls.length - 1]
-          if (!last.result) {
-            toolCalls[toolCalls.length - 1] = {
-              ...last,
-              result: block.tool_result.content,
-              isError: block.tool_result.is_error,
+    if (msg.role === 'user' && !isToolResultMsg(msg) && !isSystemInjectedMsg(msg)) {
+      // 普通 user 消息 → flush assistant, 新建 user ChatMessage
+      if (currentAssistant) {
+        result.push(currentAssistant)
+        currentAssistant = null
+        toolBlockMap.clear()
+      }
+      const blocks: ContentBlock[] = []
+      const contentBlocks = msg.content ?? []
+      if (Array.isArray(contentBlocks)) {
+        for (const block of contentBlocks) {
+          if (block.type === 'text' && block.text?.text) {
+            blocks.push({ type: 'text', text: block.text.text })
+          }
+        }
+      }
+      if (blocks.length === 0) {
+        blocks.push({ type: 'text', text: typeof msg.content === 'string' ? msg.content : '' })
+      }
+      result.push({ role: 'user', blocks })
+    } else if (msg.role === 'user' && isToolResultMsg(msg)) {
+      // tool_result 消息 — 合并到当前 assistant
+      if (!currentAssistant) continue
+      const contentBlocks = msg.content ?? []
+      for (const block of contentBlocks) {
+        if (block.type === 'tool_result' && block.tool_result) {
+          const toolUseId = block.tool_result.tool_use_id ?? ''
+          const idx = toolBlockMap.get(toolUseId)
+          if (idx !== undefined && currentAssistant.blocks[idx]) {
+            currentAssistant.blocks[idx] = {
+              ...currentAssistant.blocks[idx],
+              toolResult: block.tool_result.content,
+              toolIsError: block.tool_result.is_error,
             }
           }
         }
       }
+    } else if (msg.role === 'assistant') {
+      if (!currentAssistant) {
+        currentAssistant = { role: 'assistant', blocks: [] }
+      }
+      const contentBlocks = msg.content ?? []
+      for (const block of contentBlocks) {
+        if (block.type === 'text' && block.text?.text) {
+          currentAssistant.blocks.push({ type: 'text', text: block.text.text })
+        } else if (block.type === 'tool_use' && block.tool_use) {
+          const idx = currentAssistant.blocks.length
+          const inputStr = block.tool_use.input != null
+            ? (typeof block.tool_use.input === 'string' ? block.tool_use.input : JSON.stringify(block.tool_use.input))
+            : undefined
+          currentAssistant.blocks.push({
+            type: 'tool_call',
+            toolName: block.tool_use.name,
+            toolInput: inputStr,
+            toolUseId: block.tool_use.id,
+          })
+          if (block.tool_use.id) {
+            toolBlockMap.set(block.tool_use.id, idx)
+          }
+        }
+      }
     }
-
-    result.push({
-      role: msg.role,
-      content: text,
-      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-    })
+    // skip system / compact_boundary messages
   }
+
+  if (currentAssistant) {
+    result.push(currentAssistant)
+  }
+
   return result
 }
 
@@ -88,10 +155,10 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
     setInput('')
 
     // Add user message
-    setMessages(prev => [...prev, { role: 'user', content: prompt }])
+    setMessages(prev => [...prev, { role: 'user', blocks: [{ type: 'text', text: prompt }] }])
 
     // Add empty assistant message for streaming
-    setMessages(prev => [...prev, { role: 'assistant', content: '', isStreaming: true }])
+    setMessages(prev => [...prev, { role: 'assistant', blocks: [], isStreaming: true }])
     setStreaming(true)
 
     const onEvent = (evt: SSEEvent) => {
@@ -101,37 +168,71 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
         setMessages(prev => {
           const next = [...prev]
           const last = next[next.length - 1]
-          if (last?.role === 'assistant') {
-            next[next.length - 1] = { ...last, content: last.content + e.delta }
+          if (last?.role !== 'assistant') return prev
+          const blocks = [...last.blocks]
+          const lastBlock = blocks[blocks.length - 1]
+          if (lastBlock?.type === 'text') {
+            // append to existing text block
+            blocks[blocks.length - 1] = { ...lastBlock, text: (lastBlock.text ?? '') + e.delta }
+          } else {
+            // create new text block (after a tool_call, or first block)
+            blocks.push({ type: 'text', text: e.delta })
           }
+          next[next.length - 1] = { ...last, blocks }
           return next
         })
       } else if (e.type === 'tool_use') {
         setMessages(prev => {
           const next = [...prev]
           const last = next[next.length - 1]
-          if (last?.role === 'assistant') {
-            const toolCalls = [...(last.toolCalls ?? []), { name: e.tool_name }]
-            next[next.length - 1] = { ...last, toolCalls }
-          }
+          if (last?.role !== 'assistant') return prev
+          const blocks = [...last.blocks, {
+            type: 'tool_call' as const,
+            toolName: e.tool_name,
+            toolInput: e.tool_input,
+            toolUseId: e.tool_use_id,
+          }]
+          next[next.length - 1] = { ...last, blocks }
           return next
         })
       } else if (e.type === 'tool_result') {
         setMessages(prev => {
           const next = [...prev]
           const last = next[next.length - 1]
-          if (last?.role === 'assistant' && last.toolCalls?.length) {
-            const toolCalls = [...last.toolCalls]
-            const lastTool = toolCalls[toolCalls.length - 1]
-            if (lastTool.name === e.tool_name || !lastTool.result) {
-              toolCalls[toolCalls.length - 1] = {
-                ...lastTool,
-                result: e.content,
-                isError: e.is_error,
+          if (last?.role !== 'assistant') return prev
+          const blocks = [...last.blocks]
+          // match by tool_use_id (robust) or fall back to first unresolved (forward search)
+          let matched = false
+          if (e.tool_use_id) {
+            for (let i = 0; i < blocks.length; i++) {
+              if (blocks[i].type === 'tool_call' && blocks[i].toolUseId === e.tool_use_id) {
+                blocks[i] = { ...blocks[i], toolResult: e.content, toolIsError: e.is_error }
+                matched = true
+                break
               }
             }
-            next[next.length - 1] = { ...last, toolCalls }
           }
+          if (!matched) {
+            // fallback: forward search for first unresolved tool_call
+            for (let i = 0; i < blocks.length; i++) {
+              if (blocks[i].type === 'tool_call' && blocks[i].toolResult === undefined) {
+                blocks[i] = { ...blocks[i], toolResult: e.content, toolIsError: e.is_error }
+                break
+              }
+            }
+          }
+          next[next.length - 1] = { ...last, blocks }
+          return next
+        })
+      } else if (e.type === 'error') {
+        setMessages(prev => {
+          const next = [...prev]
+          const last = next[next.length - 1]
+          if (last?.role !== 'assistant') return prev
+          const blocks = [...last.blocks]
+          const errText = e.error || 'Unknown error'
+          blocks.push({ type: 'text', text: `Error: ${errText}` })
+          next[next.length - 1] = { ...last, blocks, isStreaming: false }
           return next
         })
       }
@@ -156,7 +257,11 @@ export function ChatArea({ sessionId, model, models, onModelChange, onSessionCre
         const next = [...prev]
         const last = next[next.length - 1]
         if (last?.role === 'assistant') {
-          next[next.length - 1] = { ...last, content: `Error: ${err}`, isStreaming: false }
+          next[next.length - 1] = {
+            ...last,
+            blocks: [...last.blocks, { type: 'text', text: `Error: ${err}` }],
+            isStreaming: false,
+          }
         }
         return next
       })

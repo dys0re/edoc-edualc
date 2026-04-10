@@ -22,6 +22,10 @@ type Config struct {
 	MaxTokens    int
 	MaxTurns     int // 0 = unlimited
 
+	// WorkDir is the current working directory.
+	// Used to dynamically load CLAUDE.md and other project-specific context.
+	WorkDir string
+
 	// AutoCompactThreshold is the token count at which auto-compact triggers.
 	// 0 = disabled. Maps to autoCompact.ts:getAutoCompactThreshold.
 	AutoCompactThreshold int
@@ -127,9 +131,10 @@ type Event struct {
 	// For text_delta / thinking_delta
 	Delta string
 
-	// For tool_use
+	// For tool_use / tool_result
 	ToolName  string
 	ToolInput string
+	ToolUseID string // tool_use block ID, for matching tool_result to tool_use
 
 	// For tool_result
 	ToolResult *tool.Result

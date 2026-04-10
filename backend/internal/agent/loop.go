@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"strings"
@@ -52,6 +53,13 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 	}
 
 	toolSchemas := ToolSchemas(cfg.Registry)
+
+	// 动态注入 CLAUDE.md — 明确工作区后再加载，不在初始 system prompt 构建时注入
+	if cfg.WorkDir != "" {
+		if claudeMd := prompt.LoadClaudeMd(cfg.WorkDir); claudeMd != "" {
+			cfg.SystemPrompt += "\n# Project Instructions (CLAUDE.md)\n" + claudeMd + "\n"
+		}
+	}
 
 	// 当前使用的模型（可能被 fallback 切换）
 	currentModel := cfg.Model
@@ -195,6 +203,7 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 
 		streamCh, err := cfg.Provider.StreamChat(ctx, req)
 		if err != nil {
+			log.Printf("[agent] StreamChat error: %v", err)
 			if handleProviderError(ctx, cfg, state, ch, err, &currentModel) {
 				continue
 			}
@@ -209,6 +218,7 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		if assistantMsg == nil && !recovered {
 			// consumeStream 已经发出了 error event（或者正常完成但无消息）
 			if len(toolUseBlocks) == 0 {
+				log.Printf("[agent] consumeStream returned nil message, no tool_use — exiting loop (turn=%d)", state.TurnCount)
 				// 无消息也无 tool_use → 已在 consumeStream 中处理
 				return
 			}
@@ -428,7 +438,7 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 
 		for _, r := range results {
 			state.Messages = append(state.Messages, r.msg)
-			ch <- Event{Type: "tool_result", ToolResult: &r.result, ToolName: r.toolName}
+			ch <- Event{Type: "tool_result", ToolResult: &r.result, ToolName: r.toolName, ToolUseID: r.toolUseID}
 
 			// Skill inline 执行：把 skill 内容注入为 user message，LLM 下一轮跟随执行
 			if r.result.Metadata["type"] == "skill_inline" && r.result.Content != "" {
@@ -571,7 +581,7 @@ func consumeStream(
 		case "thinking_delta":
 			ch <- Event{Type: "thinking_delta", Delta: evt.Delta}
 		case "tool_use":
-			ch <- Event{Type: "tool_use", ToolName: evt.ToolUse.Name, ToolInput: string(evt.ToolUse.Input)}
+			ch <- Event{Type: "tool_use", ToolName: evt.ToolUse.Name, ToolInput: string(evt.ToolUse.Input), ToolUseID: evt.ToolUse.ID}
 			toolUseBlocks = append(toolUseBlocks, evt.ToolUse)
 
 			// StreamingToolExecutor: 并发安全工具立即启动，不等 message_complete
@@ -620,6 +630,7 @@ var earlyMu sync.Mutex
 // 对标 query.ts:893-953 的 fallback + 错误恢复逻辑。
 func handleProviderError(ctx context.Context, cfg Config, state *State, ch chan<- Event, err error, currentModel *string) bool {
 	errType := provider.ClassifyError(err)
+	log.Printf("[agent] provider error: type=%v err=%v", errType, err)
 
 	switch errType {
 	case provider.ErrorRateLimit:
@@ -706,9 +717,10 @@ func handleProviderError(ctx context.Context, cfg Config, state *State, ch chan<
 // --- Tool execution ---
 
 type toolExecResult struct {
-	toolName string
-	msg      message.Message
-	result   tool.Result
+	toolName  string
+	toolUseID string
+	msg       message.Message
+	result    tool.Result
 }
 
 // executeTools runs tool calls, respecting concurrency safety.
@@ -787,9 +799,10 @@ func runSingle(ctx context.Context, reg *tool.Registry, block *message.ToolUseBl
 	if err != nil {
 		errMsg := fmt.Sprintf("Error: No such tool available: %s", block.Name)
 		return toolExecResult{
-			toolName: block.Name,
-			msg:      message.NewToolResultMessage(block.ID, errMsg, true),
-			result:   tool.Result{Content: errMsg, IsError: true},
+			toolName:  block.Name,
+			toolUseID: block.ID,
+			msg:       message.NewToolResultMessage(block.ID, errMsg, true),
+			result:    tool.Result{Content: errMsg, IsError: true},
 		}
 	}
 
@@ -797,16 +810,18 @@ func runSingle(ctx context.Context, reg *tool.Registry, block *message.ToolUseBl
 	if err != nil {
 		errMsg := fmt.Sprintf("Tool execution error: %v", err)
 		return toolExecResult{
-			toolName: block.Name,
-			msg:      message.NewToolResultMessage(block.ID, errMsg, true),
-			result:   tool.Result{Content: errMsg, IsError: true},
+			toolName:  block.Name,
+			toolUseID: block.ID,
+			msg:       message.NewToolResultMessage(block.ID, errMsg, true),
+			result:    tool.Result{Content: errMsg, IsError: true},
 		}
 	}
 
 	return toolExecResult{
-		toolName: block.Name,
-		msg:      message.NewToolResultMessage(block.ID, result.Content, result.IsError),
-		result:   *result,
+		toolName:  block.Name,
+		toolUseID: block.ID,
+		msg:       message.NewToolResultMessage(block.ID, result.Content, result.IsError),
+		result:    *result,
 	}
 }
 

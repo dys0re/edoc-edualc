@@ -3,6 +3,7 @@ package prompt
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -70,12 +71,7 @@ Only use emojis if the user asks. Reference code as file_path:line_number.
 	// 6. Environment
 	sb.WriteString(envInfoSection(env))
 
-	// 7. CLAUDE.md
-	if claudeMd := loadClaudeMd(env.WorkDir); claudeMd != "" {
-		sb.WriteString("\n# Project Instructions (CLAUDE.md)\n")
-		sb.WriteString(claudeMd)
-		sb.WriteString("\n")
-	}
+	// 7. CLAUDE.md — 不在初始 prompt 注入，由 agent loop 明确工作区后动态注入
 
 	// 8. Skills
 	if skillSection != "" {
@@ -320,10 +316,42 @@ func envInfoSection(env EnvContext) string {
 }
 
 // QuickEnvContext creates a minimal EnvContext from just a workDir.
+// Detects shell and OS so the model generates compatible commands.
 func QuickEnvContext(workDir string) EnvContext {
 	return EnvContext{
-		WorkDir: workDir,
-		IsGit:   isGitRepo(workDir),
+		WorkDir:   workDir,
+		IsGit:     isGitRepo(workDir),
+		Shell:     detectShell(),
+		OSVersion: detectOSVersion(),
+	}
+}
+
+// detectShell detects the available shell (mirrors tool.DetectShell without importing tool).
+func detectShell() string {
+	if runtime.GOOS != "windows" {
+		return "bash"
+	}
+	if _, err := exec.LookPath("pwsh"); err == nil {
+		return "powershell"
+	}
+	if _, err := exec.LookPath("powershell"); err == nil {
+		return "powershell"
+	}
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
+	}
+	return "cmd"
+}
+
+// detectOSVersion returns a brief OS identifier.
+func detectOSVersion() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Windows " + runtime.GOARCH
+	case "darwin":
+		return "macOS " + runtime.GOARCH
+	default:
+		return runtime.GOOS + " " + runtime.GOARCH
 	}
 }
 
@@ -332,7 +360,8 @@ func isGitRepo(dir string) bool {
 	return err == nil
 }
 
-func loadClaudeMd(dir string) string {
+// LoadClaudeMd loads CLAUDE.md from the given directory. Returns empty string if not found.
+func LoadClaudeMd(dir string) string {
 	path := filepath.Join(dir, "CLAUDE.md")
 	data, err := os.ReadFile(path)
 	if err != nil {
