@@ -61,10 +61,12 @@ func (h *Handler) ChatSSE(c *gin.Context) {
 	model := req.Model
 
 	reg := tool.DefaultRegistry(h.workDir, tool.NewProviderWebFetch(p, h.cfg.Provider.ModelBackup))
+	envCtx := prompt.QuickEnvContext(h.workDir)
+	envCtx.ProviderName = h.cfg.Provider.Default
 	cfg := agent.Config{
 		Provider:           p,
 		Registry:           reg,
-		SystemPrompt:       prompt.BuildSystemPromptFull(prompt.QuickEnvContext(h.workDir), "", ""),
+		SystemPrompt:       prompt.BuildSystemPromptFull(envCtx, "", ""),
 		Model:              model,
 		MaxTokens:          8192,
 		WorkDir:            h.workDir,
@@ -247,10 +249,12 @@ func (h *Handler) SessionChatSSE(c *gin.Context) {
 
 	p := h.defaultProvider
 	reg := tool.DefaultRegistry(h.workDir, tool.NewProviderWebFetch(p, h.cfg.Provider.ModelBackup))
+	envCtx2 := prompt.QuickEnvContext(h.workDir)
+	envCtx2.ProviderName = h.cfg.Provider.Default
 	cfg := agent.Config{
 		Provider:           p,
 		Registry:           reg,
-		SystemPrompt:       prompt.BuildSystemPromptFull(prompt.QuickEnvContext(h.workDir), "", ""),
+		SystemPrompt:       prompt.BuildSystemPromptFull(envCtx2, "", ""),
 		Model:              model,
 		MaxTokens:          8192,
 		WorkDir:            h.workDir,

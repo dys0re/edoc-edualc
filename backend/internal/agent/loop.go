@@ -434,7 +434,8 @@ func loop(ctx context.Context, cfg Config, messages []message.Message, ch chan<-
 		}
 
 		// ── 12. 执行 tools ──
-		results := executeTools(ctx, cfg.Registry, toolUseBlocks)
+		results := executeToolsWithEarly(ctx, cfg.Registry, toolUseBlocks, state.EarlyToolResults)
+		state.EarlyToolResults = nil
 
 		for _, r := range results {
 			state.Messages = append(state.Messages, r.msg)

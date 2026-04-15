@@ -138,6 +138,7 @@ func (h *Handler) buildAgentConfig(sessionID string) agent.Config {
 
 	env := prompt.QuickEnvContext(h.workDir)
 	env.Model = h.cfg.Provider.Model
+	env.ProviderName = h.cfg.Provider.Default
 
 	var memSection string
 	if h.memoryStore != nil {

@@ -39,16 +39,25 @@ func (t *MCPTool) Execute(ctx context.Context, input json.RawMessage) (*tool.Res
 }
 
 func (t *MCPTool) IsReadOnly(_ json.RawMessage) bool {
-	// MCP tools declare readOnlyHint in annotations; default to false (safe)
-	return false
+	return t.discovered.ReadOnlyHint
 }
 
-func (t *MCPTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
-func (t *MCPTool) NeedsApproval(_ json.RawMessage) bool     { return true }
-func (t *MCPTool) IsFileEdit(_ json.RawMessage) bool        { return false }
+func (t *MCPTool) IsConcurrencySafe(_ json.RawMessage) bool {
+	return t.discovered.IdempotentHint
+}
+
+func (t *MCPTool) NeedsApproval(_ json.RawMessage) bool {
+	return !t.discovered.ReadOnlyHint || t.discovered.DestructiveHint
+}
+
+func (t *MCPTool) IsFileEdit(_ json.RawMessage) bool { return false }
 
 func (t *MCPTool) PermissionDescription(_ json.RawMessage) string {
-	return fmt.Sprintf("MCP: %s (%s)", t.discovered.ToolName, t.discovered.ServerName)
+	hint := ""
+	if t.discovered.ReadOnlyHint {
+		hint = " [read-only]"
+	}
+	return fmt.Sprintf("MCP: %s (%s)%s", t.discovered.ToolName, t.discovered.ServerName, hint)
 }
 
 // RegisterTools adds all tools from the manager into the given registry.

@@ -179,6 +179,7 @@ func buildSystemPrompt(cfg *config.Config, workDir string, store *memory.Store, 
 	skillSection := skill.BuildSystemReminderSection(skillReg.All())
 
 	env := buildEnvContext(workDir, model, shell, reg)
+	env.ProviderName = cfg.Provider.Default
 	return prompt.BuildSystemPromptFull(env, memorySection, skillSection)
 }
 
@@ -275,7 +276,8 @@ func shellName(s tool.ShellType) string {
 // buildAgentConfig 组装 agent.Config (with Agent tool wired in).
 // taskMgr 可由调用方传入以复用（REPL 场景），传 nil 则内部新建。
 // snapStore 可由调用方传入以复用（REPL 场景），传 nil 则内部新建。
-func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback, externalTaskMgr *task.Manager, externalSnapStore *snapshot.Store) (agent.Config, *task.Manager, *team.Manager) {
+// mcpMgr 可由调用方传入以复用（REPL 场景），传 nil 则内部新建。
+func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, scanner *bufio.Scanner, permCallback tool.PermissionCallback, externalTaskMgr *task.Manager, externalSnapStore *snapshot.Store, externalMcpMgr *mcp.Manager) (agent.Config, *task.Manager, *team.Manager, *mcp.Manager) {
 	workDir := cfg.Tools.WorkDir
 	if workDir == "." {
 		workDir, _ = os.Getwd()
@@ -355,16 +357,25 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 	reg.Register(&tool.CronListTool{Manager: cronMgr})
 
 	// MCP: 连接所有配置的 server，注册发现的工具
-	if len(cfg.MCPServers) > 0 {
-		mcpMgr := mcp.NewManager()
+	var mcpMgr *mcp.Manager
+	if externalMcpMgr != nil {
+		mcpMgr = externalMcpMgr
+	} else if len(cfg.MCPServers) > 0 {
+		mcpMgr = mcp.NewManager()
 		mcpCfgs := make(map[string]mcp.ServerConfig, len(cfg.MCPServers))
 		for name, s := range cfg.MCPServers {
 			mcpCfgs[name] = mcp.ServerConfig{
-				Type:    s.Type,
-				Command: s.Command,
-				Args:    s.Args,
-				Env:     s.Env,
-				URL:     s.URL,
+				Type:              s.Type,
+				Command:           s.Command,
+				Args:              s.Args,
+				Env:               s.Env,
+				URL:               s.URL,
+				OAuthClientID:     s.OAuthClientID,
+				OAuthClientSecret: s.OAuthClientSecret,
+				OAuthScopes:       s.OAuthScopes,
+				OAuthRedirectURI:  s.OAuthRedirectURI,
+				OAuthPKCE:         s.OAuthPKCE,
+				Headers:           s.Headers,
 			}
 		}
 		if errs := mcpMgr.Connect(context.Background(), mcpCfgs); len(errs) > 0 {
@@ -372,6 +383,8 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 				fmt.Fprintf(os.Stderr, "MCP server %q connect failed: %v\n", name, err)
 			}
 		}
+	}
+	if mcpMgr != nil {
 		mcp.RegisterTools(reg, mcpMgr)
 	}
 
@@ -438,7 +451,7 @@ func buildAgentConfig(cfg *config.Config, pool *pgxpool.Pool, sessionID string, 
 
 	reg.Register(&tool.AgentTool{Resolver: resolver, TeamMgr: teamMgr})
 
-	return agentCfg, taskMgr, teamMgr
+	return agentCfg, taskMgr, teamMgr, mcpMgr
 }
 
 // buildPermissionCallback creates a REPL permission callback that reads y/n from stdin.
@@ -518,9 +531,12 @@ func buildPromptEvaluator(p provider.Provider, defaultModel string) hook.PromptE
 // runOnce executes a single prompt and exits. Maps to `claude -p "..."`.
 func runOnce(cfg *config.Config, pool *pgxpool.Pool, userPrompt string) {
 	scanner := bufio.NewScanner(os.Stdin)
-	agentCfg, taskMgr, teamMgr := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner), nil, nil)
+	agentCfg, taskMgr, teamMgr, mcpMgr := buildAgentConfig(cfg, pool, "", scanner, buildPermissionCallback(scanner), nil, nil, nil)
 	defer taskMgr.Close()
 	defer teamMgr.Close()
+	if mcpMgr != nil {
+		defer mcpMgr.Close()
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -559,6 +575,14 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 
 	// 持久化 snapStore，跨 agent 轮次共享文件快照
 	replSnapStore := snapshot.NewStore(workDir)
+
+	// 持久化 mcpMgr，跨 agent 轮次复用 MCP 连接
+	var replMcpMgr *mcp.Manager
+	defer func() {
+		if replMcpMgr != nil {
+			replMcpMgr.Close()
+		}
+	}()
 
 	// 创建或恢复会话
 	var currentSessionID string
@@ -735,7 +759,8 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 			history = loaded
 			fmt.Printf("Loaded %d messages from history.\n", len(history))
 
-			agentCfg, _, teamMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner), replTaskMgr, replSnapStore)
+			agentCfg, _, teamMgr, mcpMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner), replTaskMgr, replSnapStore, replMcpMgr)
+				replMcpMgr = mcpMgr
 			defer teamMgr.Close()
 			history = runAgentLoop(scanner, agentCfg, history)
 			continue
@@ -872,7 +897,7 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 				continue
 			}
 			reviewPrompt := "Please review the following git diff for bugs, issues, and improvements:\n\n```diff\n" + diff + "\n```"
-			agentCfg, _, teamMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner), replTaskMgr, replSnapStore)
+			agentCfg, _, teamMgr, _ := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner), replTaskMgr, replSnapStore, replMcpMgr)
 			defer teamMgr.Close()
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 			for evt := range agent.Run(ctx, agentCfg, reviewPrompt) {
@@ -884,7 +909,7 @@ func runREPL(cfg *config.Config, pool *pgxpool.Pool) {
 		}
 
 		// ── Normal prompt ──
-		agentCfg, _, teamMgr := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner), replTaskMgr, replSnapStore)
+		agentCfg, _, teamMgr, _ := buildAgentConfig(cfg, pool, currentSessionID, scanner, buildPermissionCallback(scanner), replTaskMgr, replSnapStore, replMcpMgr)
 		defer teamMgr.Close()
 
 		// UserPromptSubmit hooks: 在用户提交 prompt 后、agent 执行前触发

@@ -86,13 +86,20 @@ type LogConfig struct {
 // MCPServerConfig describes a single MCP server connection.
 // Maps to Claude Code's mcpServers in settings.json.
 type MCPServerConfig struct {
-	Type    string   `mapstructure:"type"`    // "stdio" (default) or "sse"
+	Type    string   `mapstructure:"type"`    // "stdio" (default) or "sse" or "http"
 	Command string   `mapstructure:"command"` // stdio: executable
 	Args    []string `mapstructure:"args"`    // stdio: arguments
 	Env     []string `mapstructure:"env"`     // stdio: KEY=VALUE env vars
-	URL     string   `mapstructure:"url"`     // sse: server URL
-}
+	URL     string            `mapstructure:"url"`     // sse/http: server URL
+	Headers map[string]string `mapstructure:"headers"` // HTTP headers (e.g. Authorization)
 
+	// OAuth fields (for SSE/HTTP servers requiring authentication)
+	OAuthClientID     string   `mapstructure:"oauth_client_id"`
+	OAuthClientSecret string   `mapstructure:"oauth_client_secret"`
+	OAuthScopes       []string `mapstructure:"oauth_scopes"`
+	OAuthRedirectURI  string   `mapstructure:"oauth_redirect_uri"`
+	OAuthPKCE         bool     `mapstructure:"oauth_pkce"`
+}
 // Load reads config from file + env vars + defaults.
 // configFile: 配置文件路径，空则自动搜索 (./config.yaml, ./config.yml)
 func Load(configFile string) (*Config, error) {

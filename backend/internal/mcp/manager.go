@@ -8,18 +8,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // ServerConfig describes a single MCP server connection.
 // Maps to Claude Code's McpSdkServerConfig.
 type ServerConfig struct {
-	// Type: "stdio" (default) or "sse"
+	// Type: "stdio" (default) or "sse" or "http"
 	Type string `yaml:"type" mapstructure:"type"`
 
 	// Stdio fields
@@ -28,7 +30,15 @@ type ServerConfig struct {
 	Env     []string `yaml:"env"     mapstructure:"env"` // KEY=VALUE pairs
 
 	// SSE / HTTP fields
-	URL string `yaml:"url" mapstructure:"url"`
+	URL     string            `yaml:"url"     mapstructure:"url"`
+	Headers map[string]string `yaml:"headers" mapstructure:"headers"` // HTTP headers (e.g. Authorization)
+
+	// OAuth fields (for SSE/HTTP servers requiring authentication)
+	OAuthClientID     string   `yaml:"oauth_client_id"     mapstructure:"oauth_client_id"`
+	OAuthClientSecret string   `yaml:"oauth_client_secret" mapstructure:"oauth_client_secret"`
+	OAuthScopes       []string `yaml:"oauth_scopes"        mapstructure:"oauth_scopes"`
+	OAuthRedirectURI  string   `yaml:"oauth_redirect_uri"  mapstructure:"oauth_redirect_uri"`
+	OAuthPKCE         bool     `yaml:"oauth_pkce"          mapstructure:"oauth_pkce"`
 }
 
 // ConnectedServer holds a live MCP client connection and its discovered tools.
@@ -48,18 +58,33 @@ type DiscoveredTool struct {
 	Description string
 	// InputSchema is the raw JSON Schema from the MCP server
 	InputSchema map[string]interface{}
-	client      *mcpclient.Client
+	// Annotations from MCP server tool hints
+	ReadOnlyHint    bool
+	DestructiveHint bool
+	IdempotentHint  bool
+	OpenWorldHint   bool
+	client          *mcpclient.Client
+}
+
+// toolRef is an index entry for O(1) tool lookup.
+type toolRef struct {
+	server *ConnectedServer
+	tool   *DiscoveredTool
 }
 
 // Manager manages connections to all configured MCP servers.
 type Manager struct {
-	mu      sync.RWMutex
-	servers map[string]*ConnectedServer
+	mu        sync.RWMutex
+	servers   map[string]*ConnectedServer
+	toolIndex map[string]*toolRef // fullName → ref
 }
 
 // NewManager creates an empty manager.
 func NewManager() *Manager {
-	return &Manager{servers: make(map[string]*ConnectedServer)}
+	return &Manager{
+		servers:   make(map[string]*ConnectedServer),
+		toolIndex: make(map[string]*toolRef),
+	}
 }
 
 // Connect connects to all servers in the config map.
@@ -89,18 +114,42 @@ func (m *Manager) connectOne(ctx context.Context, name string, cfg ServerConfig)
 	var c *mcpclient.Client
 	var err error
 
+	hasOAuth := cfg.OAuthClientID != "" || cfg.OAuthPKCE
+
 	switch strings.ToLower(cfg.Type) {
 	case "sse", "http":
 		if cfg.URL == "" {
 			return fmt.Errorf("MCP server %q: url is required for type=%q", name, cfg.Type)
 		}
-		c, err = mcpclient.NewSSEMCPClient(cfg.URL)
-		if err != nil {
-			return fmt.Errorf("MCP server %q: SSE connect: %w", name, err)
-		}
-		// SSE client needs explicit Start
-		if err = c.Start(ctx); err != nil {
-			return fmt.Errorf("MCP server %q: SSE start: %w", name, err)
+
+		if hasOAuth {
+			// Use OAuth-aware client directly
+			c, err = connectWithOAuth(ctx, name, cfg.URL, cfg)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Try plain connection first
+			var sseOpts []transport.ClientOption
+			if len(cfg.Headers) > 0 {
+				sseOpts = append(sseOpts, transport.WithHeaders(cfg.Headers))
+			}
+			c, err = mcpclient.NewSSEMCPClient(cfg.URL, sseOpts...)
+			if err != nil {
+				return fmt.Errorf("MCP server %q: SSE connect: %w", name, err)
+			}
+			if err = c.Start(ctx); err != nil {
+				// Check if server requires OAuth
+				if mcpclient.IsOAuthAuthorizationRequiredError(err) {
+					log.Printf("[mcp] server %q requires OAuth, starting authorization flow", name)
+					c, err = connectWithOAuth(ctx, name, cfg.URL, cfg)
+					if err != nil {
+						return err
+					}
+				} else {
+					return fmt.Errorf("MCP server %q: SSE start: %w", name, err)
+				}
+			}
 		}
 	default: // stdio
 		if cfg.Command == "" {
@@ -141,21 +190,29 @@ func (m *Manager) connectOne(ctx context.Context, name string, cfg ServerConfig)
 	for _, t := range result.Tools {
 		schema := toolInputSchemaToMap(t)
 		tools = append(tools, DiscoveredTool{
-			FullName:    buildToolName(name, t.Name),
-			ServerName:  name,
-			ToolName:    t.Name,
-			Description: t.Description,
-			InputSchema: schema,
-			client:      c,
+			FullName:        buildToolName(name, t.Name),
+			ServerName:      name,
+			ToolName:        t.Name,
+			Description:     t.Description,
+			InputSchema:     schema,
+			ReadOnlyHint:    derefBool(t.Annotations.ReadOnlyHint, false),
+			DestructiveHint: derefBool(t.Annotations.DestructiveHint, true),
+			IdempotentHint:  derefBool(t.Annotations.IdempotentHint, false),
+			OpenWorldHint:   derefBool(t.Annotations.OpenWorldHint, true),
+			client:          c,
 		})
 	}
 
 	m.mu.Lock()
-	m.servers[name] = &ConnectedServer{
+	srv := &ConnectedServer{
 		Name:   name,
 		Config: cfg,
 		client: c,
 		Tools:  tools,
+	}
+	m.servers[name] = srv
+	for i := range srv.Tools {
+		m.toolIndex[srv.Tools[i].FullName] = &toolRef{server: srv, tool: &srv.Tools[i]}
 	}
 	m.mu.Unlock()
 
@@ -178,26 +235,65 @@ func (m *Manager) AllTools() []DiscoveredTool {
 func (m *Manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, srv := range m.servers {
-		srv.client.Close()
+	for name, srv := range m.servers {
+		if err := srv.client.Close(); err != nil {
+			log.Printf("[mcp] close server %q: %v", name, err)
+		}
 	}
 	m.servers = make(map[string]*ConnectedServer)
+	m.toolIndex = make(map[string]*toolRef)
 }
 
 // CallTool invokes a tool on the appropriate MCP server.
+// Uses O(1) index lookup. Attempts one reconnect on failure.
 func (m *Manager) CallTool(ctx context.Context, fullName string, input json.RawMessage) (string, bool, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	ref, ok := m.toolIndex[fullName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", true, fmt.Errorf("MCP tool not found: %s", fullName)
+	}
 
-	for _, srv := range m.servers {
-		for _, t := range srv.Tools {
-			if t.FullName != fullName {
-				continue
-			}
-			return callMCPTool(ctx, t.client, t.ToolName, input)
+	content, isErr, err := callMCPTool(ctx, ref.tool.client, ref.tool.ToolName, input)
+	if err != nil {
+		// Attempt reconnect once
+		serverName := ref.server.Name
+		log.Printf("[mcp] tool call failed for %s, attempting reconnect to %q: %v", fullName, serverName, err)
+		if reconnectErr := m.reconnectServer(ctx, serverName); reconnectErr != nil {
+			return "", true, fmt.Errorf("MCP tool call failed: %w (reconnect also failed: %v)", err, reconnectErr)
+		}
+		// Re-lookup after reconnect (index is rebuilt)
+		m.mu.RLock()
+		ref, ok = m.toolIndex[fullName]
+		m.mu.RUnlock()
+		if !ok {
+			return "", true, fmt.Errorf("MCP tool not found after reconnect: %s", fullName)
+		}
+		return callMCPTool(ctx, ref.tool.client, ref.tool.ToolName, input)
+	}
+	return content, isErr, nil
+}
+
+// reconnectServer closes and reconnects a single MCP server.
+func (m *Manager) reconnectServer(ctx context.Context, name string) error {
+	m.mu.RLock()
+	srv, ok := m.servers[name]
+	cfg := srv.Config
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("server %q not found for reconnect", name)
+	}
+	// Clean old index entries for this server
+	m.mu.Lock()
+	for k, ref := range m.toolIndex {
+		if ref.server.Name == name {
+			delete(m.toolIndex, k)
 		}
 	}
-	return "", true, fmt.Errorf("MCP tool not found: %s", fullName)
+	delete(m.servers, name)
+	m.mu.Unlock()
+
+	return m.connectOne(ctx, name, cfg)
 }
 
 func callMCPTool(ctx context.Context, c *mcpclient.Client, toolName string, input json.RawMessage) (string, bool, error) {
@@ -273,4 +369,12 @@ func toolInputSchemaToMap(t mcp.Tool) map[string]interface{} {
 		result["required"] = schema.Required
 	}
 	return result
+}
+
+// derefBool dereferences a *bool with a default value.
+func derefBool(p *bool, def bool) bool {
+	if p != nil {
+		return *p
+	}
+	return def
 }

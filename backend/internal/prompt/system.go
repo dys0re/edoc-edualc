@@ -26,6 +26,10 @@ type EnvContext struct {
 
 	EnabledTools []string
 	IsWorktree   bool
+
+	// ProviderName identifies the provider ("anthropic" or "openai").
+	// Used to inject provider-specific behavioral guidance.
+	ProviderName string
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -54,7 +58,7 @@ Do not generate or guess URLs unless they help the user with programming.
 `)
 
 	// 3. Tool routing — 告诉模型有哪些工具、怎么选
-	sb.WriteString(slimToolSection(env.EnabledTools))
+	sb.WriteString(slimToolSection(env.EnabledTools, env.ProviderName))
 
 	// 4. Output style — 极简
 	sb.WriteString(`
@@ -88,7 +92,7 @@ func BuildSystemPrompt(env EnvContext) string {
 	return BuildSystemPromptFull(env, "", "")
 }
 
-func slimToolSection(enabledTools []string) string {
+func slimToolSection(enabledTools []string, providerName string) string {
 	toolSet := make(map[string]bool, len(enabledTools))
 	for _, t := range enabledTools {
 		toolSet[t] = true
@@ -96,6 +100,16 @@ func slimToolSection(enabledTools []string) string {
 
 	var sb strings.Builder
 	sb.WriteString("\n# Tools\n")
+
+	// 行动指令：对 GPT 系列模型必须显式指示主动使用工具。
+	// Claude 天然 action-biased 不需要这段，但加上也无害。
+	// GPT 的 RLHF 训练使其倾向 "先问再做"，需要显式覆盖。
+	if providerName != "anthropic" {
+		sb.WriteString("IMPORTANT: When the user's request can be fulfilled by calling a tool, call it DIRECTLY. " +
+			"Do NOT ask for confirmation or offer to help — just do it. " +
+			"For example, if the user asks \"what's trending on GitHub\", immediately call WebFetch or the relevant tool.\n")
+	}
+
 	sb.WriteString("Use dedicated tools instead of Bash when available:")
 	if toolSet["Read"] {
 		sb.WriteString(" Read(not cat/head/tail),")
@@ -113,6 +127,31 @@ func slimToolSection(enabledTools []string) string {
 		sb.WriteString(" Grep(not grep/rg).")
 	}
 	sb.WriteString("\nCall independent tools in parallel. Sequential only when there are dependencies.\n")
+
+	// Web 工具提示
+	if toolSet["WebFetch"] || toolSet["WebSearch"] {
+		sb.WriteString("You have web access: ")
+		if toolSet["WebFetch"] {
+			sb.WriteString("WebFetch(fetch URL content) ")
+		}
+		if toolSet["WebSearch"] {
+			sb.WriteString("WebSearch(search the internet) ")
+		}
+		sb.WriteString("— use them when the user asks about web content, trending topics, or current information.\n")
+	}
+
+	// MCP 工具提示：检测 mcp__ 前缀的工具
+	hasMCP := false
+	for _, t := range enabledTools {
+		if strings.HasPrefix(t, "mcp__") {
+			hasMCP = true
+			break
+		}
+	}
+	if hasMCP {
+		sb.WriteString("MCP tools (prefixed mcp__) connect to external services — use them when relevant.\n")
+	}
+
 	return sb.String()
 }
 
