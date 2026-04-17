@@ -1,0 +1,43 @@
+# edoc-edualc 基础配置
+# 敏感配置（API key、DB 密码）放 application-{profile}.yml，不提交到 git
+#
+# Profile 激活优先级:
+#   EDOC_PROFILE 环境变量 > 本文件的 profile 字段
+# 环境变量覆盖优先级:
+#   环境变量 > application-{profile}.yml > application.yml > 默认值
+
+profile: dev   # 激活的 profile，对应 application-dev.yml
+
+server:
+  port: 8080          # HTTP 端口 (EDOC_SERVER_PORT)
+  mode: release       # gin 模式: debug / release / test
+
+provider:
+  default: openai     # 默认 provider: anthropic / openai (EDOC_PROVIDER)
+  model: gpt-5.4      # 默认模型 (EDOC_MODEL)
+  fallback_model: ""  # 模型限流时自动降级，空=不降级 (EDOC_PROVIDER_FALLBACK_MODEL)
+  models:
+    - gpt-5.4
+
+agent:
+  max_turns: 0        # Agent 最大循环轮数，0=无限 (EDOC_AGENT_MAX_TURNS)
+  max_tokens: 8192    # 单次回复最大 token 数 (EDOC_AGENT_MAX_TOKENS)
+  auto_compact_threshold: 0  # 自动压缩阈值(token数)，0=禁用
+
+tools:
+  work_dir: "../"     # 工具工作目录 (EDOC_TOOLS_WORK_DIR)
+  shell: auto         # Shell: auto / powershell / bash / cmd (EDOC_TOOLS_SHELL)
+  memory_dir: ""      # 记忆存储目录，空=自动推导 ~/.edoc/projects/<path>/memory/
+  bocha_api_key: ""   # Bocha AI Search API key (BOCHA_API_KEY)
+
+database:
+  url: ""             # 完整连接串，优先级最高 (DATABASE_URL)
+  host: localhost
+  port: 5432
+  user: postgres
+  password: ""
+  dbname: edoc
+  sslmode: disable
+
+log:
+  level: info         # debug / info / warn / error (EDOC_LOG_LEVEL)

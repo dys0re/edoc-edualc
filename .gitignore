@@ -1,6 +1,6 @@
 .playwright-cli/
 .playwright/
 .claude/
-backend/config.yaml
-backend/config.yml
+backend/resources/application-*.yml
+!backend/resources/application-example.yml
 backend/edoc

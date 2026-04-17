@@ -152,7 +152,7 @@ func Doctor(cfg *config.Config, workDir string, pool *pgxpool.Pool) string {
 // MCP lists configured MCP servers.
 func MCP(cfg *config.Config) string {
 	if len(cfg.MCPServers) == 0 {
-		return "No MCP servers configured.\nAdd mcp_servers to config.yaml to enable MCP."
+		return "No MCP servers configured.\nAdd mcp_servers to resources/application-dev.yml to enable MCP."
 	}
 
 	names := make([]string, 0, len(cfg.MCPServers))

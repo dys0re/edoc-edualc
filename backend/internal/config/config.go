@@ -2,14 +2,16 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/viper"
 )
 
 // Config holds all application configuration.
-// 对标 Spring Boot application.yml，统一管理所有配置项。
-// Viper 加载优先级: 命令行 flag > 环境变量 > config.yaml > 默认值
+// 对标 Spring Boot application.yml + application-{profile}.yml。
+// Viper 加载优先级: 命令行 flag > 环境变量 > application-{profile}.yml > application.yml > 默认值
 type Config struct {
 	Server    ServerConfig             `mapstructure:"server"`
 	Provider  ProviderConfig           `mapstructure:"provider"`
@@ -100,24 +102,38 @@ type MCPServerConfig struct {
 	OAuthRedirectURI  string   `mapstructure:"oauth_redirect_uri"`
 	OAuthPKCE         bool     `mapstructure:"oauth_pkce"`
 }
-// Load reads config from file + env vars + defaults.
-// configFile: 配置文件路径，空则自动搜索 (./config.yaml, ./config.yml)
+// Load reads config from application.yml + application-{profile}.yml + env vars + defaults.
+// 对标 Spring Boot 配置加载:
+//   1. 加载 application.yml (base)
+//   2. 读取 profile 字段 (默认 "dev")，合并 application-{profile}.yml
+//   3. 环境变量覆盖一切
+//
+// configFile: 显式配置文件路径，非空则跳过自动搜索 (兼容 --config 参数)
 func Load(configFile string) (*Config, error) {
 	v := viper.New()
 
 	// 默认值
 	setDefaults(v)
 
+	// 搜索路径 — 对标 Spring Boot 的 classpath:/resources/ 约定
+	searchPaths := []string{
+		"./resources",
+		".",
+		"./backend/resources",
+		"./backend",
+		"$HOME/.edoc",
+		"/etc/edoc",
+	}
+
 	// 配置文件
 	if configFile != "" {
 		v.SetConfigFile(configFile)
 	} else {
-		v.SetConfigName("config")
+		v.SetConfigName("application")
 		v.SetConfigType("yaml")
-		v.AddConfigPath(".")
-		v.AddConfigPath("./backend")
-		v.AddConfigPath("$HOME/.edoc")
-		v.AddConfigPath("/etc/edoc")
+		for _, p := range searchPaths {
+			v.AddConfigPath(p)
+		}
 	}
 
 	// 环境变量覆盖: EDOC_SERVER_PORT → server.port
@@ -139,10 +155,41 @@ func Load(configFile string) (*Config, error) {
 	// Bocha AI Search API key
 	_ = v.BindEnv("tools.bocha_api_key", "BOCHA_API_KEY")
 
-	// 读配置文件（不存在不报错，纯环境变量也能跑）
+	// 读 base 配置文件（不存在不报错，纯环境变量也能跑）
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			return nil, fmt.Errorf("read config: %w", err)
+		}
+	}
+
+	// --- Profile 合并: 对标 Spring Boot spring.profiles.active ---
+	// 优先级: EDOC_PROFILE 环境变量 > application.yml 中的 profile 字段
+	profile := os.Getenv("EDOC_PROFILE")
+	if profile == "" {
+		profile = v.GetString("profile")
+	}
+	if profile != "" {
+		pv := viper.New()
+		pv.SetConfigName("application-" + profile)
+		pv.SetConfigType("yaml")
+		if configFile != "" {
+			// --config 指定了路径，profile 文件在同目录
+			pv.AddConfigPath(filepath.Dir(configFile))
+		} else {
+			for _, p := range searchPaths {
+				pv.AddConfigPath(p)
+			}
+		}
+		if err := pv.ReadInConfig(); err != nil {
+			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+				return nil, fmt.Errorf("read profile config (application-%s.yml): %w", profile, err)
+			}
+			// profile 文件不存在不报错，只用 base
+		} else {
+			// 合并: profile 覆盖 base
+			if err := v.MergeConfigMap(pv.AllSettings()); err != nil {
+				return nil, fmt.Errorf("merge profile config: %w", err)
+			}
 		}
 	}
 
