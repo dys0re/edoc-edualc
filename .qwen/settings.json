@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(copy *)",
+      "Bash(git rm *)",
+      "Bash(git *)",
+      "Bash(foreach-object *)",
+      "Bash(rd *)"
+    ]
+  },
+  "$version": 3
+}
